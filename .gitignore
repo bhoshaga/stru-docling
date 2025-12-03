@@ -8,6 +8,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+# But keep prebuilt .so files for deployment
+!prebuilt/**/*.so
 .Python
 build/
 dist/
