@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 
 def convert_pdf_fast(pdf_path, server_url="http://localhost:5001"):
-    """Convert PDF with ~1.7x speedup using parallel page ranges."""
+    """Convert PDF with ~1.5x speedup using parallel page ranges."""
 
     # Get page count first (or estimate/hardcode)
     page_count = get_page_count(pdf_path)  # implement this
@@ -44,15 +44,17 @@ def convert_pdf_fast(pdf_path, server_url="http://localhost:5001"):
     def convert_range(page_range):
         start, end = page_range
         with open(pdf_path, 'rb') as f:
+            # IMPORTANT: page_range must be sent as multiple form fields (array format)
             return requests.post(
                 f"{server_url}/v1/convert/file",
                 files={'files': f},
-                data={
-                    'to_formats': 'md',
-                    'do_ocr': 'false',
-                    'do_table_structure': 'false',
-                    'page_range': (start, end)
-                }
+                data=[
+                    ('to_formats', 'md'),
+                    ('do_ocr', 'false'),
+                    ('do_table_structure', 'false'),
+                    ('page_range', str(start)),  # First element of array
+                    ('page_range', str(end)),    # Second element of array
+                ]
             ).json()
 
     # Process both ranges in parallel
@@ -62,6 +64,34 @@ def convert_pdf_fast(pdf_path, server_url="http://localhost:5001"):
     # Merge markdown outputs
     return merge_results(results)
 ```
+
+> **CRITICAL: `page_range` API Format**
+> The `page_range` parameter is an **array of 2 integers** `[start, end]`.
+> In multipart form data, arrays must be sent as **multiple fields with the same name**.
+>
+> **Working curl example (single line):**
+> ```bash
+> curl -X POST http://localhost:5001/v1/convert/file -F "files=@sample-drawing.pdf" -F "to_formats=md" -F "page_range=1" -F "page_range=5"
+> ```
+>
+> **Working Python requests example:**
+> ```python
+> requests.post(url, files={'files': f}, data=[
+>     ('to_formats', 'md'),
+>     ('page_range', '1'),   # start page
+>     ('page_range', '5'),   # end page
+> ])
+> ```
+>
+> **WRONG - these will be IGNORED and process ALL pages:**
+> ```bash
+> # WRONG: page_range as single value
+> -F "page_range=1-5"
+> -F "page_range=1,5"
+> # WRONG: backslash line continuations can break in markdown/copy-paste
+> curl -X POST url \
+>   -F "files=@file.pdf"
+> ```
 
 **Optimal parallelism by hardware:**
 | Hardware | Optimal parallel requests |

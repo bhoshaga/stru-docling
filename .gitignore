@@ -45,3 +45,9 @@ logs/
 *.pem
 *.key
 credentials.json
+
+# docling-parse-patched build artifacts
+docling-parse-patched/build/
+docling-parse-patched/externals/
+docling-parse-patched/*.egg-info/
+docling-parse-patched/docling_parse/*.so
