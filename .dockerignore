@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+
+# Data and logs
+data/
+*.log
+*.json
+
+# Dev files
+.git/
+.gitignore
+*.md
+donotuse/
+marker_output*/
+server_output/
+
+# Misc
+.DS_Store
+*.tar.gz

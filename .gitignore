@@ -71,3 +71,17 @@ sample-doc/
 # Personal notes/experiments
 learning_*.md
 benchmark_*.py
+hist.md
+io_guide.md
+lagrange.md
+prob4.md
+terms.md
+
+# Large binaries
+*.tar.gz
+
+# LaTeX temp files
+*.tex
+
+# Images
+*.png
