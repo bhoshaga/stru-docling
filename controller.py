@@ -416,12 +416,13 @@ async def restart_worker(worker_id: str, reason: str = "manual"):
     worker = workers[worker_id]
     port = worker["port"]
     old_pid = worker["pid"]
-    pages_before = worker["pages_processed"]
+    current_life_pages = worker.get("current_life_pages", 0)
+    lifetime_pages = worker.get("lifetime_pages", 0)
 
     logger.info("=" * 60)
     logger.info(f"[WORKER RESTART] {worker_id} (port {port}) - STARTING")
     logger.info(f"[WORKER RESTART] Reason: {reason}")
-    logger.info(f"[WORKER RESTART] Old PID: {old_pid}, Pages processed: {pages_before}")
+    logger.info(f"[WORKER RESTART] Old PID: {old_pid}, current_life_pages={current_life_pages}, lifetime_pages={lifetime_pages}")
     logger.info("=" * 60)
 
     # Mark as restarting to block new task assignments
