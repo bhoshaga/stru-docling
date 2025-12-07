@@ -28,7 +28,12 @@ namespace pdflib
     std::string operator[](std::string key);
 
     void initialise(std::string dirname);
-    
+
+    // Memory debugging
+    size_t get_name_to_code_count() const { return name_to_code.size(); }
+    size_t get_name_to_utf8_count() const { return name_to_utf8.size(); }
+    size_t get_unknown_glyphs_count() const { return unknown_glyphs.size(); }
+
   private:
 
     void read_file_hex(std::string filename);

@@ -19,6 +19,9 @@ namespace pdflib
     template<typename glyphs_type>
     void initialise(std::string dirname, glyphs_type& glyphs);
 
+    // Memory debugging
+    size_t get_encoding_count() const { return name_to_encoding.size(); }
+
   private:
 
     bool initialized;

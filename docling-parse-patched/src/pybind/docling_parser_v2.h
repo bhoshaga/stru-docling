@@ -4,6 +4,9 @@
 #define PYBIND_PDF_PARSER_V2_H
 
 #include <optional>
+#include <fstream>
+#include <chrono>
+#include <ctime>
 #ifdef _WIN32
 #include <locale>
 #include <codecvt>
@@ -23,6 +26,7 @@ namespace docling
   public:
 
     docling_parser_v2();
+    ~docling_parser_v2();
 
     docling_parser_v2(std::string level);
 
@@ -122,7 +126,23 @@ namespace docling
     std::map<std::string, double> timings = {};
     pdflib::pdf_resource<pdflib::PAGE_FONT>::initialise(data, timings);
   }
-  
+
+  docling_parser_v2::~docling_parser_v2()
+  {
+    std::ofstream logfile("/Users/bhoshaga/stru-docling/logs/memory_trace.log", std::ios::app);
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+    logfile << "=== ~docling_parser_v2 DESTRUCTOR CALLED ===" << std::endl;
+    logfile << "  timestamp: " << std::ctime(&time_t_now);
+    logfile << "  key2doc.size(): " << key2doc.size() << " (any remaining docs will be destroyed)" << std::endl;
+    for(auto& kv : key2doc) {
+      logfile << "    remaining key: " << kv.first << ", use_count: " << kv.second.use_count() << std::endl;
+    }
+    logfile << "  NOTE: After this destructor, all remaining documents in key2doc will be destroyed" << std::endl;
+    logfile << std::endl;
+    logfile.close();
+  }
+
   void docling_parser_v2::set_loglevel(int level)
   {
     if(level>=3)
@@ -191,6 +211,15 @@ namespace docling
 
   bool docling_parser_v2::load_document(std::string key, std::string filename, std::optional<std::string> password)
   {
+    std::ofstream logfile("/Users/bhoshaga/stru-docling/logs/memory_trace.log", std::ios::app);
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+    logfile << "=== load_document (from file) CALLED ===" << std::endl;
+    logfile << "  timestamp: " << std::ctime(&time_t_now);
+    logfile << "  key: " << key << std::endl;
+    logfile << "  filename: " << filename << std::endl;
+    logfile << "  key2doc.size() BEFORE: " << key2doc.size() << std::endl;
+
 #ifdef _WIN32
     // Convert UTF-8 string to UTF-16 wstring
     std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;
@@ -204,21 +233,38 @@ namespace docling
       {
         //key2doc[key] = std::filesystem::path(filename);
 	key2doc[key] = std::make_shared<decoder_type>();
+	logfile << "  shared_ptr created, use_count: " << key2doc[key].use_count() << std::endl;
 	key2doc.at(key)->process_document_from_file(filename, password);
+	logfile << "  key2doc.size() AFTER: " << key2doc.size() << std::endl;
+	logfile << "  SUCCESS: document loaded" << std::endl;
+	logfile << std::endl;
+	logfile.close();
 	return true;
       }
 
+    logfile << "  ERROR: File not found" << std::endl;
+    logfile << std::endl;
+    logfile.close();
     LOG_S(ERROR) << "File not found: " << filename;
     return false;
   }
 
   bool docling_parser_v2::load_document_from_bytesio(std::string key, pybind11::object bytes_io)
   {
+    std::ofstream logfile("/Users/bhoshaga/stru-docling/logs/memory_trace.log", std::ios::app);
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+    logfile << "=== load_document_from_bytesio CALLED ===" << std::endl;
+    logfile << "  timestamp: " << std::ctime(&time_t_now);
+    logfile << "  key: " << key << std::endl;
+    logfile << "  key2doc.size() BEFORE: " << key2doc.size() << std::endl;
+
     logging_lib::info("pdf-parser") << __FILE__ << ":" << __LINE__ << "\t" << __FUNCTION__;
 
     // Check if the object is a BytesIO object
     if (!pybind11::hasattr(bytes_io, "read")) {
-
+      logfile << "  ERROR: Not a BytesIO object" << std::endl;
+      logfile.close();
       throw std::runtime_error("Expected a BytesIO object");
     }
 
@@ -230,16 +276,23 @@ namespace docling
 
     // Get a pointer to the data
     std::string data_str = data.cast<std::string>();
+    logfile << "  bytesio data size: " << data_str.size() << " bytes (" << (data_str.size() / 1024 / 1024) << " MB)" << std::endl;
 
     try
       {
 	key2doc[key] = std::make_shared<decoder_type>();
+	logfile << "  shared_ptr created, use_count: " << key2doc[key].use_count() << std::endl;
 	key2doc.at(key)->process_document_from_bytesio(data_str);
-
+	logfile << "  key2doc.size() AFTER: " << key2doc.size() << std::endl;
+	logfile << "  SUCCESS: document loaded from bytesio" << std::endl;
+	logfile << std::endl;
+	logfile.close();
 	return true;
       }
     catch(const std::exception& exc)
       {
+	logfile << "  ERROR: " << exc.what() << std::endl;
+	logfile.close();
 	LOG_S(ERROR) << "could not docode bytesio object for key="<<key;
 	return false;
       }
@@ -249,17 +302,33 @@ namespace docling
 
   bool docling_parser_v2::unload_document(std::string key)
   {
+    std::ofstream logfile("/Users/bhoshaga/stru-docling/logs/memory_trace.log", std::ios::app);
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+    logfile << "=== unload_document CALLED ===" << std::endl;
+    logfile << "  timestamp: " << std::ctime(&time_t_now);
+    logfile << "  key: " << key << std::endl;
+    logfile << "  key2doc.size() BEFORE erase: " << key2doc.size() << std::endl;
+
     if(key2doc.count(key)==1)
       {
+	logfile << "  shared_ptr use_count BEFORE erase: " << key2doc[key].use_count() << std::endl;
 	key2doc.erase(key);
+	logfile << "  key2doc.size() AFTER erase: " << key2doc.size() << std::endl;
+	logfile << "  SUCCESS: key erased, shared_ptr destroyed (if use_count was 1, destructor should have been called)" << std::endl;
+	logfile << std::endl;
+	logfile.close();
 	return true;
       }
     else
       {
+	logfile << "  ERROR: key not found!" << std::endl;
+	logfile << std::endl;
+	logfile.close();
 	LOG_S(ERROR) << "key not found: " << key;
       }
-    
-    return false;    
+
+    return false;
   }
 
   bool docling_parser_v2::unload_document_page(std::string key, int page_num)

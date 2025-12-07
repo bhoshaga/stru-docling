@@ -4,8 +4,13 @@
 #define PDF_DOCUMENT_DECODER_H
 
 #include <optional>
+#include <fstream>
+#include <chrono>
+#include <ctime>
 #include <qpdf/QPDF.hh>
 //#include <qpdf/QPDFPageObjectHelper.hh>
+
+#include <v2/pdf_resources/page_font.h>
 
 namespace pdflib
 {
@@ -110,7 +115,72 @@ namespace pdflib
   }
 
   pdf_decoder<DOCUMENT>::~pdf_decoder()
-  {}
+  {
+    // Write to log file for debugging memory leak
+    std::ofstream logfile("/Users/bhoshaga/stru-docling/logs/memory_trace.log", std::ios::app);
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+    logfile << "=== ~pdf_decoder<DOCUMENT> DESTRUCTOR CALLED ===" << std::endl;
+    logfile << "  timestamp: " << std::ctime(&time_t_now);
+    logfile << "  filename: " << filename << std::endl;
+    logfile << "  buffer.size(): " << buffer.size() << " bytes (" << (buffer.size() / 1024 / 1024) << " MB)" << std::endl;
+    logfile << "  buffer.capacity(): " << buffer.capacity() << " bytes" << std::endl;
+    logfile << "  number_of_pages: " << number_of_pages << std::endl;
+
+    // JSON sizes
+    std::string json_doc_str = json_document.dump();
+    std::string json_ann_str = json_annots.dump();
+    logfile << "  json_document.dump().size(): " << json_doc_str.size() << " bytes (" << (json_doc_str.size() / 1024 / 1024) << " MB)" << std::endl;
+    logfile << "  json_annots.dump().size(): " << json_ann_str.size() << " bytes" << std::endl;
+
+    // Count pages in json_document
+    if (json_document.contains("pages")) {
+      logfile << "  json_document[pages].size(): " << json_document["pages"].size() << std::endl;
+    }
+
+    // QPDF object info
+    logfile << "  qpdf_document.getAllPages().size(): " << qpdf_document.getAllPages().size() << std::endl;
+    logfile << "  qpdf_document.getObjectCount(): " << qpdf_document.getObjectCount() << std::endl;
+
+    // Timings map size
+    logfile << "  timings.size(): " << timings.size() << " entries" << std::endl;
+
+    logfile << "  === CLEARING DATA ===" << std::endl;
+
+    // Explicitly clear to measure
+    size_t buffer_was = buffer.size();
+    buffer.clear();
+    buffer.shrink_to_fit();
+    logfile << "  buffer cleared (was " << buffer_was << " bytes)" << std::endl;
+
+    json_document.clear();
+    logfile << "  json_document cleared" << std::endl;
+
+    json_annots.clear();
+    logfile << "  json_annots cleared" << std::endl;
+
+    timings.clear();
+    logfile << "  timings cleared" << std::endl;
+
+    logfile << "  NOTE: qpdf_document will be destroyed after this destructor returns" << std::endl;
+    logfile << std::endl;
+    logfile.close();
+
+    // Log static font cache sizes directly
+    {
+      std::ofstream cachelog("/Users/bhoshaga/stru-docling/logs/memory_trace.log", std::ios::app);
+      cachelog << "=== STATIC FONT CACHE SIZES ===" << std::endl;
+      cachelog << "  glyphs.name_to_code: " << pdf_resource<PAGE_FONT>::glyphs.get_name_to_code_count() << std::endl;
+      cachelog << "  glyphs.name_to_utf8: " << pdf_resource<PAGE_FONT>::glyphs.get_name_to_utf8_count() << std::endl;
+      cachelog << "  glyphs.unknown_glyphs: " << pdf_resource<PAGE_FONT>::glyphs.get_unknown_glyphs_count() << std::endl;
+      cachelog << "  cids.cids: " << pdf_resource<PAGE_FONT>::cids.get_cids_count() << std::endl;
+      cachelog << "  cids.cmap: " << pdf_resource<PAGE_FONT>::cids.get_cmap_count() << std::endl;
+      cachelog << "  encodings: " << pdf_resource<PAGE_FONT>::encodings.get_encoding_count() << std::endl;
+      cachelog << "  bfonts: " << pdf_resource<PAGE_FONT>::bfonts.get_basefont_count() << std::endl;
+      cachelog << std::endl;
+      cachelog.close();
+    }
+  }
 
   void pdf_decoder<DOCUMENT>::update_qpdf_logger()
   {
@@ -283,8 +353,17 @@ namespace pdflib
 		<< "keep_lines: " << keep_lines << ", "
 		<< "keep_bitmaps: " << keep_bitmaps << ", "
 		<< "create_word_cells: " << create_word_cells << ", "
-      		<< "create_line_cells: " << create_line_cells << ")";  
-						   
+      		<< "create_line_cells: " << create_line_cells << ")";
+
+    // Log decode start
+    std::ofstream logfile("/Users/bhoshaga/stru-docling/logs/memory_trace.log", std::ios::app);
+    logfile << "=== decode_document CALLED ===" << std::endl;
+    logfile << "  page_numbers.size(): " << page_numbers.size() << std::endl;
+    logfile << "  pages requested: ";
+    for (auto p : page_numbers) logfile << p << " ";
+    logfile << std::endl;
+    logfile.close();
+
     utils::timer timer;
 
     // make sure that we only return the page from the page-numbers
@@ -361,19 +440,37 @@ namespace pdflib
 	    
 	    json_pages.push_back(page);
 
+	    // Log per-page info
+	    {
+	      std::ofstream plogfile("/Users/bhoshaga/stru-docling/logs/memory_trace.log", std::ios::app);
+	      plogfile << "  page " << page_number << " decoded:" << std::endl;
+	      plogfile << "    page JSON size: " << page.dump().size() << " bytes" << std::endl;
+	      plogfile << "    json_pages.size(): " << json_pages.size() << std::endl;
+	      plogfile << "    json_document.dump().size(): " << json_document.dump().size() << " bytes" << std::endl;
+	      plogfile.close();
+	    }
+
 	    std::stringstream ss;
 	    ss << "decoding page " << page_number;
-	    
-	    timings[ss.str()] = page_timer.get_time();	    
+
+	    timings[ss.str()] = page_timer.get_time();
 	  }
 	else
 	  {
-	    LOG_S(WARNING) << "page " << page_number << " is out of bounds ...";        
-	    
+	    LOG_S(WARNING) << "page " << page_number << " is out of bounds ...";
+
 	    nlohmann::json none;
 	    json_pages.push_back(none);
 	  }
       }
+
+    // Log decode complete
+    {
+      std::ofstream plogfile("/Users/bhoshaga/stru-docling/logs/memory_trace.log", std::ios::app);
+      plogfile << "=== decode_document COMPLETE ===" << std::endl;
+      plogfile << "  total json_document.dump().size(): " << json_document.dump().size() << " bytes (" << (json_document.dump().size() / 1024 / 1024) << " MB)" << std::endl;
+      plogfile.close();
+    }
 
     timings[__FUNCTION__] = timer.get_time();
   }

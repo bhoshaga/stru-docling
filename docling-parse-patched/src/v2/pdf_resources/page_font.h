@@ -86,12 +86,29 @@ namespace pdflib
 
     void print_tables();
 
-  private:
+    // Memory debugging - static method to log cache sizes
+    static void log_static_cache_sizes(const std::string& context) {
+      std::ofstream logfile("/Users/bhoshaga/stru-docling/logs/memory_trace.log", std::ios::app);
+      logfile << "=== STATIC FONT CACHE SIZES (" << context << ") ===" << std::endl;
+      logfile << "  glyphs.name_to_code: " << glyphs.get_name_to_code_count() << std::endl;
+      logfile << "  glyphs.name_to_utf8: " << glyphs.get_name_to_utf8_count() << std::endl;
+      logfile << "  glyphs.unknown_glyphs: " << glyphs.get_unknown_glyphs_count() << std::endl;
+      logfile << "  cids.cids: " << cids.get_cids_count() << std::endl;
+      logfile << "  cids.cmap: " << cids.get_cmap_count() << std::endl;
+      logfile << "  encodings: " << encodings.get_encoding_count() << std::endl;
+      logfile << "  bfonts: " << bfonts.get_basefont_count() << std::endl;
+      logfile << std::endl;
+      logfile.close();
+    }
 
+  public:
+    // Made public for memory debugging
     static font_glyphs    glyphs;
     static font_cids      cids;
     static font_encodings encodings;
     static base_fonts     bfonts;
+
+  private:
 
   private:
 

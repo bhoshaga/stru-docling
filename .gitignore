@@ -53,3 +53,21 @@ docling-parse-patched/build/
 docling-parse-patched/externals/
 docling-parse-patched/*.egg-info/
 docling-parse-patched/docling_parse/*.so
+
+# Output directories
+data/
+server_output/
+marker_output/
+marker_output_chunks/
+marker_output_html/
+marker_output_json/
+donotuse/
+sample-doc/
+
+# Fonts
+*.otf
+*.ttf
+
+# Personal notes/experiments
+learning_*.md
+benchmark_*.py

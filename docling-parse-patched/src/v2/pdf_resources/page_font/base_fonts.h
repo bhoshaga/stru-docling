@@ -35,6 +35,9 @@ namespace pdflib
     template<typename glyphs_type>
     void initialise(std::string filename, glyphs_type& glyphs);
 
+    // Memory debugging
+    size_t get_basefont_count() const { return name_to_basefont.size(); }
+
   private:
 
     std::string normalise(std::string font_name);

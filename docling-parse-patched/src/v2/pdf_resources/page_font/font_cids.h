@@ -24,12 +24,16 @@ namespace pdflib
     bool      has(std::string font_name);
     font_cid& get(std::string encoding_name);
 
-    int get_supplement(std::string registry, 
+    int get_supplement(std::string registry,
 		       std::string ordering);
 
     bool decode_cmap_resource(std::string font_name);
 
     void decode_all();
+
+    // Memory debugging
+    size_t get_cids_count() const { return cids.size(); }
+    size_t get_cmap_count() const { return cmap_2_filename.size(); }
 
   private:
 
