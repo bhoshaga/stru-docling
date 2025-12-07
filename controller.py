@@ -1264,10 +1264,20 @@ async def poll_status(task_id: str, _: str = Depends(verify_api_key)):
                     job_manager.complete_sub_job(sub_job.sub_job_id, error=error)
                     logger.warning(f"[JOB {task_id}] Worker {sub_job.worker_port} failed to return result: {error}")
                     any_failed = True
+                # Mark worker as ready
+                wid = get_worker_id(sub_job.worker_port)
+                if wid in workers:
+                    workers[wid]["state"] = "ready"
+                    load_balancer.update_worker(sub_job.worker_port, workers[wid])
             elif status == "failure":
                 job_manager.complete_sub_job(sub_job.sub_job_id, error="Worker task failed")
                 logger.error(f"[JOB {task_id}] Worker {sub_job.worker_port} FAILED for pages {sub_job.original_pages[0]}-{sub_job.original_pages[1]}")
                 any_failed = True
+                # Mark worker as ready even on failure
+                wid = get_worker_id(sub_job.worker_port)
+                if wid in workers:
+                    workers[wid]["state"] = "ready"
+                    load_balancer.update_worker(sub_job.worker_port, workers[wid])
             else:
                 all_complete = False
 
@@ -1382,6 +1392,12 @@ async def _proxy_chunk_request(
     """Proxy a chunk request to a single worker."""
     file_bytes = await files.read()
     filename = files.filename or "document.pdf"
+    is_pdf = filename.lower().endswith(".pdf")
+
+    # Check tier limits
+    limit_error = check_file_limits(file_bytes, api_key, is_pdf=is_pdf)
+    if limit_error:
+        raise HTTPException(status_code=413, detail=limit_error)
 
     # Get available workers
     allowed_ports = get_workers_for_api_key(api_key)
