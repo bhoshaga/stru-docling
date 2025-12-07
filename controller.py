@@ -71,6 +71,9 @@ from helpers import (
     upload_router,
     init_upload_router,
     cleanup_old_uploads,
+    uploaded_files,
+    stats_router,
+    init_stats_router,
 )
 
 # =============================================================================
@@ -183,21 +186,17 @@ async def lifespan(app: FastAPI):
         load_balancer.assign_api_key_pool(api_key, allowed_ports)
         logger.info(f"[CONTROLLER] Assigned API key '{api_key}' to ports: {allowed_ports}")
 
-    # Initialize upload router with dependencies
+    # Initialize upload router with dependencies (only needs auth and limits)
     init_upload_router(
         verify_api_key_func=verify_api_key,
-        get_workers_for_api_key_func=get_workers_for_api_key,
         check_file_limits_func=check_file_limits,
-        get_worker_id_func=get_worker_id,
-        workers_dict=workers,
-        load_balancer_obj=load_balancer,
-        job_manager_obj=job_manager,
-        get_page_count_func=get_page_count,
-        split_pdf_for_workers_func=split_pdf_for_workers,
-        submit_to_worker_func=submit_to_worker,
-        poll_worker_status_func=poll_worker_status,
-        get_worker_result_func=get_worker_result,
-        merge_document_results_func=_merge_document_results,
+    )
+
+    # Initialize stats router with dependencies
+    init_stats_router(
+        verify_api_key_func=verify_api_key,
+        get_workers_func=lambda: workers,
+        get_start_time_func=lambda: getattr(app.state, "start_time", None),
     )
 
     # Start background tasks
@@ -244,8 +243,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Docling Controller", version="2.0.0", lifespan=lifespan)
 
-# Include upload router
+# Include routers
 app.include_router(upload_router)
+app.include_router(stats_router)
 
 # Round-robin index for load balancing proxy requests
 _rr_index = 0
@@ -1150,6 +1150,371 @@ async def convert_file_sync(
     return merged
 
 
+# =============================================================================
+# CONVERT SOURCE ENDPOINTS (for uploaded files or URLs)
+# =============================================================================
+
+@app.post("/v1/convert/source/async")
+async def convert_source_async(
+    request: Request,
+    api_key: str = Depends(verify_api_key),
+):
+    """
+    Convert a document from source (file_id from upload or URL).
+
+    Request body should be JSON with:
+    - file_id: ID returned from /v1/upload
+    - OR source: URL to fetch document from
+    - to_formats: Output format (default: "json")
+    - page_range: Optional [start, end] for PDF pages
+    """
+    body = await request.json()
+    file_id = body.get("file_id")
+    source_url = body.get("source")
+    to_formats = body.get("to_formats", "json")
+    page_range = body.get("page_range")
+
+    if not file_id and not source_url:
+        raise HTTPException(status_code=400, detail="Must provide either file_id or source URL")
+
+    if source_url:
+        # Proxy to worker for URL source
+        logger.info(f"[SOURCE] Proxying URL source to worker: {source_url}")
+
+        allowed_ports = get_workers_for_api_key(api_key)
+        available_workers = [
+            p for p in allowed_ports
+            if get_worker_id(p) in workers and workers[get_worker_id(p)].get("state") == "ready"
+        ]
+
+        if not available_workers:
+            raise HTTPException(status_code=503, detail="No workers available")
+
+        worker_port = load_balancer.select_single_worker(api_key)
+        if not worker_port:
+            worker_port = available_workers[0]
+
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            resp = await client.post(
+                f"http://127.0.0.1:{worker_port}/v1/convert/source/async",
+                json=body,
+            )
+
+            if resp.status_code != 200:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
+            result = resp.json()
+            if "task_id" in result:
+                chunk_tasks[result["task_id"]] = worker_port
+            return result
+
+    # For file_id: Get file and process
+    if file_id not in uploaded_files:
+        raise HTTPException(status_code=404, detail="File not found. Upload first with /v1/upload")
+
+    upload_info = uploaded_files[file_id]
+    if upload_info["api_key"] != api_key:
+        raise HTTPException(status_code=403, detail="File belongs to different API key")
+
+    filepath = upload_info["filepath"]
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="File no longer exists on disk")
+
+    with open(filepath, "rb") as f:
+        file_bytes = f.read()
+
+    filename = upload_info["filename"]
+    is_pdf = filename.lower().endswith(".pdf")
+
+    logger.info(f"[SOURCE] Converting uploaded file {file_id}: {filename}")
+
+    # Check tier limits
+    limit_error = check_file_limits(file_bytes, api_key, is_pdf=is_pdf)
+    if limit_error:
+        raise HTTPException(status_code=413, detail=limit_error)
+
+    # Get available workers
+    allowed_ports = get_workers_for_api_key(api_key)
+    available_workers = [
+        p for p in allowed_ports
+        if get_worker_id(p) in workers and workers[get_worker_id(p)].get("state") == "ready"
+    ]
+
+    if not available_workers:
+        raise HTTPException(status_code=503, detail="No workers available")
+
+    # Non-PDF: single worker
+    if not is_pdf:
+        coolest_port = load_balancer.select_single_worker(api_key)
+        if not coolest_port:
+            coolest_port = available_workers[0]
+
+        job = job_manager.create_job(filename=filename, total_pages=1, user_page_range=None)
+        job_manager.start_job(job.job_id)
+
+        sub_job = job_manager.add_sub_job(
+            job_id=job.job_id,
+            worker_port=coolest_port,
+            original_pages=(1, 1),
+        )
+
+        task_id, error = await submit_to_worker(coolest_port, file_bytes, filename, to_formats)
+        if error:
+            job_manager.complete_sub_job(sub_job.sub_job_id, error=error)
+            raise HTTPException(status_code=500, detail=f"Worker error: {error}")
+
+        job_manager.register_worker_task(sub_job.sub_job_id, task_id)
+
+        return {
+            "task_id": job.job_id,
+            "status": "pending",
+            "total_pages": 1,
+            "workers_used": 1,
+        }
+
+    # PDF: Split across workers
+    try:
+        total_pages = get_page_count(file_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid PDF: {e}")
+
+    user_range = None
+    if page_range and len(page_range) >= 2:
+        try:
+            user_range = (int(page_range[0]), int(page_range[1]))
+        except (ValueError, IndexError):
+            pass
+
+    if user_range:
+        start_page, end_page = user_range
+        start_page = max(1, min(start_page, total_pages))
+        end_page = max(start_page, min(end_page, total_pages))
+        pages_to_process = end_page - start_page + 1
+    else:
+        start_page, end_page = 1, total_pages
+        pages_to_process = total_pages
+
+    job = job_manager.create_job(
+        filename=filename,
+        total_pages=pages_to_process,
+        user_page_range=user_range,
+    )
+    logger.info(f"[JOB {job.job_id}] Created from file_id: {filename}, {pages_to_process} pages, {len(available_workers)} workers available")
+
+    try:
+        chunks = split_pdf_for_workers(file_bytes, len(available_workers), user_range)
+        logger.info(f"[JOB {job.job_id}] SPLIT: {len(chunks)} chunks across {len(chunks)} workers")
+        for i, (chunk_bytes, pr) in enumerate(chunks):
+            worker_port = available_workers[i]
+            chunk_mb = len(chunk_bytes) / (1024 * 1024)
+            pages = pr[1] - pr[0] + 1
+            logger.info(f"[JOB {job.job_id}]   Chunk {i+1}: pages {pr[0]}-{pr[1]} ({pages} pages, {chunk_mb:.1f}MB) -> worker {worker_port}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error splitting PDF: {e}")
+
+    job_manager.start_job(job.job_id)
+
+    async def submit_chunk(chunk_data, port):
+        chunk_bytes, original_pages = chunk_data
+        sub_job = job_manager.add_sub_job(
+            job_id=job.job_id,
+            worker_port=port,
+            original_pages=original_pages,
+        )
+        task_id, error = await submit_to_worker(port, chunk_bytes, filename, to_formats)
+        if error:
+            job_manager.complete_sub_job(sub_job.sub_job_id, error=error)
+            return False
+        job_manager.register_worker_task(sub_job.sub_job_id, task_id)
+        return True
+
+    tasks = [submit_chunk(chunk, port) for chunk, port in zip(chunks, available_workers)]
+    await asyncio.gather(*tasks)
+
+    # Update worker page counts (both current life and lifetime)
+    for port in available_workers[:len(chunks)]:
+        worker_id = get_worker_id(port)
+        if worker_id in workers:
+            pages_for_worker = pages_to_process // len(chunks)
+            workers[worker_id]["current_life_pages"] = workers[worker_id].get("current_life_pages", 0) + pages_for_worker
+            workers[worker_id]["lifetime_pages"] = workers[worker_id].get("lifetime_pages", 0) + pages_for_worker
+            load_balancer.update_worker(port, workers[worker_id])
+
+    return {
+        "task_id": job.job_id,
+        "status": "pending",
+        "total_pages": pages_to_process,
+        "workers_used": len(chunks),
+    }
+
+
+@app.post("/v1/convert/source")
+async def convert_source_sync(
+    request: Request,
+    api_key: str = Depends(verify_api_key),
+):
+    """
+    Synchronous version of /v1/convert/source/async.
+    Blocks until conversion is complete and returns the result.
+    """
+    body = await request.json()
+    file_id = body.get("file_id")
+    source_url = body.get("source")
+    to_formats = body.get("to_formats", "json")
+    page_range = body.get("page_range")
+
+    if not file_id and not source_url:
+        raise HTTPException(status_code=400, detail="Must provide either file_id or source URL")
+
+    if source_url:
+        # Proxy to worker for URL source
+        allowed_ports = get_workers_for_api_key(api_key)
+        available_workers = [
+            p for p in allowed_ports
+            if get_worker_id(p) in workers and workers[get_worker_id(p)].get("state") == "ready"
+        ]
+
+        if not available_workers:
+            raise HTTPException(status_code=503, detail="No workers available")
+
+        worker_port = load_balancer.select_single_worker(api_key)
+        if not worker_port:
+            worker_port = available_workers[0]
+
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            resp = await client.post(
+                f"http://127.0.0.1:{worker_port}/v1/convert/source",
+                json=body,
+            )
+
+            if resp.status_code != 200:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
+            return resp.json()
+
+    # For file_id: Get file and process
+    if file_id not in uploaded_files:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    upload_info = uploaded_files[file_id]
+    if upload_info["api_key"] != api_key:
+        raise HTTPException(status_code=403, detail="File belongs to different API key")
+
+    filepath = upload_info["filepath"]
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="File no longer exists on disk")
+
+    with open(filepath, "rb") as f:
+        file_bytes = f.read()
+
+    filename = upload_info["filename"]
+    is_pdf = filename.lower().endswith(".pdf")
+
+    # Get available workers
+    allowed_ports = get_workers_for_api_key(api_key)
+    available_workers = [
+        p for p in allowed_ports
+        if get_worker_id(p) in workers and workers[get_worker_id(p)].get("state") == "ready"
+    ]
+
+    if not available_workers:
+        raise HTTPException(status_code=503, detail="No workers available")
+
+    # Non-PDF: single worker
+    if not is_pdf:
+        coolest_port = load_balancer.select_single_worker(api_key)
+        if not coolest_port:
+            coolest_port = available_workers[0]
+
+        task_id, error = await submit_to_worker(coolest_port, file_bytes, filename, to_formats)
+        if error:
+            raise HTTPException(status_code=500, detail=f"Worker error: {error}")
+
+        while True:
+            status, _ = await poll_worker_status(coolest_port, task_id)
+            if status == "success":
+                result, error = await get_worker_result(coolest_port, task_id)
+                if error:
+                    raise HTTPException(status_code=500, detail=f"Failed to get result: {error}")
+                return result
+            elif status == "failure":
+                raise HTTPException(status_code=500, detail="Worker task failed")
+            await asyncio.sleep(0.5)
+
+    # PDF: Split and wait for all
+    try:
+        total_pages = get_page_count(file_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid PDF: {e}")
+
+    user_range = None
+    if page_range and len(page_range) >= 2:
+        try:
+            user_range = (int(page_range[0]), int(page_range[1]))
+        except (ValueError, IndexError):
+            pass
+
+    try:
+        chunks = split_pdf_for_workers(file_bytes, len(available_workers), user_range)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error splitting PDF: {e}")
+
+    # Submit all chunks
+    async def submit_chunk(chunk_data, port):
+        chunk_bytes, original_pages = chunk_data
+        task_id, error = await submit_to_worker(port, chunk_bytes, filename, to_formats)
+        if error:
+            return None
+        return (port, task_id, original_pages)
+
+    tasks = [submit_chunk(chunk, port) for chunk, port in zip(chunks, available_workers)]
+    results = await asyncio.gather(*tasks)
+    task_info = [r for r in results if r is not None]
+
+    if not task_info:
+        raise HTTPException(status_code=500, detail="Failed to submit to any worker")
+
+    # Update worker page counts
+    pages_to_process = sum(chunk[1][1] - chunk[1][0] + 1 for chunk in chunks)
+    for port in available_workers[:len(chunks)]:
+        worker_id = get_worker_id(port)
+        if worker_id in workers:
+            pages_for_worker = pages_to_process // len(chunks)
+            workers[worker_id]["current_life_pages"] = workers[worker_id].get("current_life_pages", 0) + pages_for_worker
+            workers[worker_id]["lifetime_pages"] = workers[worker_id].get("lifetime_pages", 0) + pages_for_worker
+
+    # Poll until all complete
+    max_wait = 600
+    start_time = time.time()
+    completed_results = {}
+
+    while len(completed_results) < len(task_info):
+        if time.time() - start_time > max_wait:
+            raise HTTPException(status_code=504, detail=f"Conversion timed out after {max_wait}s")
+
+        for port, task_id, page_range_chunk in task_info:
+            if task_id in completed_results:
+                continue
+
+            status, _ = await poll_worker_status(port, task_id)
+
+            if status == "success":
+                result, error = await get_worker_result(port, task_id)
+                if result:
+                    completed_results[task_id] = {"pages": page_range_chunk, "result": result}
+                else:
+                    completed_results[task_id] = {"pages": page_range_chunk, "result": {"status": "failure", "errors": [{"message": error}]}}
+            elif status == "failure":
+                completed_results[task_id] = {"pages": page_range_chunk, "result": {"status": "failure", "errors": [{"message": "Worker reported failure"}]}}
+
+        if len(completed_results) < len(task_info):
+            await asyncio.sleep(0.5)
+
+    # Merge results
+    sub_results = list(completed_results.values())
+    return _merge_document_results(sub_results, filename)
+
+
 def _aggregate_job_results(job) -> dict:
     """
     Aggregate results from all sub-jobs for internal stats tracking.
@@ -1565,58 +1930,6 @@ async def chunk_hybrid_source_async(
 ):
     """Hybrid chunking from URL source (async)."""
     return await _proxy_chunk_source_request(request, "/v1/chunk/hybrid/source/async", api_key, is_async=True)
-
-
-# =============================================================================
-# STATS ENDPOINT
-# =============================================================================
-
-@app.get("/stats")
-async def get_stats(_: str = Depends(verify_api_key)):
-    """Get processing statistics."""
-    job_stats = job_manager.get_stats()
-    storage_stats = result_storage.get_storage_stats()
-    pool_status = load_balancer.get_pool_status()
-
-    return {
-        "jobs": job_stats,
-        "storage": storage_stats,
-        "workers": pool_status,
-        "uptime": time.time() - app.state.start_time if hasattr(app.state, "start_time") else 0,
-    }
-
-
-# =============================================================================
-# WORKER MANAGEMENT ENDPOINTS
-# =============================================================================
-
-@app.get("/status")
-async def get_status(_: str = Depends(verify_api_key)):
-    """Get status of all workers."""
-    worker_list = []
-    for worker_id, worker in workers.items():
-        pid = worker["pid"]
-        running = pid is not None and psutil.pid_exists(pid)
-        worker_list.append({
-            "worker_id": worker_id,
-            "port": worker["port"],
-            "pid": pid,
-            "running": running,
-            "state": worker["state"],
-            "current_life_pages": worker.get("current_life_pages", 0),
-            "lifetime_pages": worker.get("lifetime_pages", 0),
-            "restart_count": worker.get("restart_count", 0),
-            "last_restart_at": worker.get("last_restart_at"),
-            "last_restart_reason": worker.get("last_restart_reason"),
-            "current_job_id": worker.get("current_job_id"),
-            "memory_mb": worker.get("memory_mb", 0),
-        })
-
-    return {
-        "workers": sorted(worker_list, key=lambda w: w["port"]),
-        "total": len(workers),
-        "running": sum(1 for w in worker_list if w["running"]),
-    }
 
 
 @app.get("/health")

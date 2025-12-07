@@ -29,6 +29,10 @@ from .upload_router import (
     cleanup_old_uploads,
     uploaded_files,
 )
+from .stats_router import (
+    router as stats_router,
+    init_router as init_stats_router,
+)
 
 __all__ = [
     # PDF utils
@@ -54,4 +58,7 @@ __all__ = [
     "init_upload_router",
     "cleanup_old_uploads",
     "uploaded_files",
+    # Stats router
+    "stats_router",
+    "init_stats_router",
 ]
