@@ -296,7 +296,7 @@ async def lifespan(app: FastAPI):
 # GLOBALS
 # =============================================================================
 
-app = FastAPI(title="Docling Controller", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Docling Controller", version="2.0.0", lifespan=lifespan, openapi_url=None, docs_url=None, redoc_url=None)
 
 # Include routers
 app.include_router(upload_router)
@@ -532,20 +532,35 @@ def start_worker_process(port: int) -> int:
 
 
 def get_real_pid_on_port(port: int) -> int | None:
-    """Get the actual PID of the process listening on a port using psutil.
+    """Get the actual PID of the process listening on a port using lsof.
 
     This is the source of truth - more reliable than stored PIDs which can
     become stale (zombie processes, restarts, etc).
-
-    Uses psutil instead of lsof for better container compatibility and performance.
     """
     try:
-        for conn in psutil.net_connections("inet"):
-            if conn.laddr.port == port and conn.status == "LISTEN":
-                return conn.pid
+        result = subprocess.run(
+            ["lsof", "-ti", f":{port}"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        logger.debug(f"[PID_CHECK] lsof :{port} -> returncode={result.returncode}, stdout='{result.stdout.strip()}', stderr='{result.stderr.strip()}'")
+        if result.returncode == 0 and result.stdout.strip():
+            # lsof may return multiple PIDs, take the first one
+            pid_str = result.stdout.strip().split('\n')[0]
+            logger.debug(f"[PID_CHECK] port {port} -> PID {pid_str}")
+            return int(pid_str)
+        # Log why we're returning None
+        if result.returncode != 0:
+            logger.info(f"[PID_CHECK] port {port}: lsof returned code {result.returncode} (no process listening)")
+        elif not result.stdout.strip():
+            logger.info(f"[PID_CHECK] port {port}: lsof returned empty output (no process listening)")
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning(f"[PID_CHECK] lsof timed out for port {port}")
         return None
     except Exception as e:
-        logger.warning(f"[PID_CHECK] Failed to get PID on port {port}: {e}")
+        logger.warning(f"[PID_CHECK] lsof failed for port {port}: {type(e).__name__}: {e}")
         return None
 
 
@@ -1918,21 +1933,31 @@ async def get_version():
 # =============================================================================
 
 @app.get("/docs", include_in_schema=False)
-async def docs_redirect():
-    """Redirect /docs to worker's docs."""
-    return RedirectResponse(f"/{MIN_PORT}/docs")
+async def docs_page():
+    """Serve Swagger UI pointing to worker's OpenAPI spec."""
+    from fastapi.openapi.docs import get_swagger_ui_html
+    return get_swagger_ui_html(openapi_url="/openapi.json", title="Docling API")
 
 
 @app.get("/redoc", include_in_schema=False)
-async def redoc_redirect():
-    """Redirect /redoc to worker's redoc."""
-    return RedirectResponse(f"/{MIN_PORT}/redoc")
+async def redoc_page():
+    """Serve ReDoc pointing to worker's OpenAPI spec."""
+    from fastapi.openapi.docs import get_redoc_html
+    return get_redoc_html(openapi_url="/openapi.json", title="Docling API")
 
 
 @app.get("/openapi.json", include_in_schema=False)
-async def openapi_redirect():
-    """Redirect /openapi.json to worker's OpenAPI spec."""
-    return RedirectResponse(f"/{MIN_PORT}/openapi.json")
+async def openapi_proxy():
+    """Proxy OpenAPI spec from worker for rich documentation."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"http://{WORKER_HOST}:{MIN_PORT}/openapi.json")
+            if resp.status_code == 200:
+                return Response(content=resp.content, media_type="application/json")
+    except Exception as e:
+        logger.warning(f"Failed to fetch worker OpenAPI: {e}")
+    # Fallback: return minimal spec
+    return {"openapi": "3.0.0", "info": {"title": "Docling API", "version": "1.0.0"}, "paths": {}}
 
 
 # =============================================================================
