@@ -76,6 +76,8 @@ from helpers import (
     stats_router,
     init_stats_router,
     merge_document_results,
+    chunk_router,
+    init_chunk_router,
 )
 
 # =============================================================================
@@ -204,6 +206,15 @@ async def lifespan(app: FastAPI):
         get_start_time_func=lambda: getattr(app.state, "start_time", None),
     )
 
+    # Initialize chunk router with dependencies
+    init_chunk_router(
+        verify_api_key_func=verify_api_key,
+        check_file_limits_func=check_file_limits,
+        get_available_workers_func=get_available_workers,
+        load_balancer=load_balancer,
+        chunk_tasks_dict=chunk_tasks,
+    )
+
     # Start background tasks
     background_tasks.append(asyncio.create_task(watchdog()))
     background_tasks.append(asyncio.create_task(cleanup_task()))
@@ -251,6 +262,7 @@ app = FastAPI(title="Docling Controller", version="2.0.0", lifespan=lifespan)
 # Include routers
 app.include_router(upload_router)
 app.include_router(stats_router)
+app.include_router(chunk_router)
 
 # Round-robin index for load balancing proxy requests
 _rr_index = 0
@@ -741,20 +753,19 @@ async def poll_worker_status(port: int, task_id: str) -> Tuple[str, Optional[dic
 
     Returns:
         (status, result_if_complete)
+
+    Raises:
+        Exception if worker is unreachable (connection error, timeout, etc.)
     """
     url = f"http://{WORKER_HOST}:{port}/v1/status/poll/{task_id}"
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url)
-            if response.status_code == 200:
-                data = response.json()
-                return data.get("task_status", "unknown"), data
-            else:
-                return "error", {"error": f"Status {response.status_code}"}
-
-    except Exception as e:
-        return "error", {"error": str(e)}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("task_status", "unknown"), data
+        else:
+            raise Exception(f"Worker {port} returned status {response.status_code}")
 
 
 async def get_worker_result(port: int, task_id: str) -> Tuple[Optional[dict], Optional[str]]:
@@ -817,25 +828,29 @@ async def submit_chunk_with_page_split(
             return None, error
 
         # Poll until complete
-        while True:
-            status, _ = await poll_worker_status(port, task_id)
-            if status == "success":
-                result, err = await get_worker_result(port, task_id)
-                # Set worker state back to ready
-                worker_id = get_worker_id(port)
-                if worker_id in workers:
-                    workers[worker_id]["state"] = "ready"
-                    workers[worker_id]["last_activity"] = time.time()
-                    load_balancer.update_worker(port, workers[worker_id])
-                return result, err
-            elif status == "failure":
-                # Set worker state back to ready even on failure
-                worker_id = get_worker_id(port)
-                if worker_id in workers:
-                    workers[worker_id]["state"] = "ready"
-                    load_balancer.update_worker(port, workers[worker_id])
-                return None, f"Worker task {task_id} failed"
-            await asyncio.sleep(0.3)
+        try:
+            while True:
+                status, _ = await poll_worker_status(port, task_id)
+                if status == "success":
+                    result, err = await get_worker_result(port, task_id)
+                    # Set worker state back to ready
+                    worker_id = get_worker_id(port)
+                    if worker_id in workers:
+                        workers[worker_id]["state"] = "ready"
+                        workers[worker_id]["last_activity"] = time.time()
+                        load_balancer.update_worker(port, workers[worker_id])
+                    return result, err
+                elif status == "failure":
+                    # Set worker state back to ready even on failure
+                    worker_id = get_worker_id(port)
+                    if worker_id in workers:
+                        workers[worker_id]["state"] = "ready"
+                        load_balancer.update_worker(port, workers[worker_id])
+                    return None, f"Worker task {task_id} failed"
+                await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.warning(f"[PAGE_SPLIT] Worker {port} unreachable: {e}")
+            return None, f"Worker {port} unreachable: {e}"
 
     # Multiple pages: split, submit all, poll all, merge
     logger.info(f"[PAGE_SPLIT] Splitting {num_pages} pages for worker {port} (pages {start_page}-{end_page})")
@@ -883,20 +898,24 @@ async def submit_chunk_with_page_split(
     max_wait = 300  # 5 minutes
     start_time = time.time()
 
-    while pending and (time.time() - start_time) < max_wait:
-        for task_id in list(pending.keys()):
-            status, _ = await poll_worker_status(port, task_id)
-            if status == "success":
-                result, err = await get_worker_result(port, task_id)
-                if result:
-                    completed[task_id] = (pending[task_id], result)
-                del pending[task_id]
-            elif status == "failure":
-                logger.warning(f"[PAGE_SPLIT] Page {pending[task_id]} failed")
-                del pending[task_id]
+    try:
+        while pending and (time.time() - start_time) < max_wait:
+            for task_id in list(pending.keys()):
+                status, _ = await poll_worker_status(port, task_id)
+                if status == "success":
+                    result, err = await get_worker_result(port, task_id)
+                    if result:
+                        completed[task_id] = (pending[task_id], result)
+                    del pending[task_id]
+                elif status == "failure":
+                    logger.warning(f"[PAGE_SPLIT] Page {pending[task_id]} failed")
+                    del pending[task_id]
 
-        if pending:
-            await asyncio.sleep(0.3)
+            if pending:
+                await asyncio.sleep(0.3)
+    except Exception as e:
+        logger.warning(f"[PAGE_SPLIT] Worker {port} unreachable: {e}")
+        return None, f"Worker {port} unreachable: {e}"
 
     if pending:
         logger.warning(f"[PAGE_SPLIT] Timeout waiting for {len(pending)} pages")
@@ -1204,17 +1223,23 @@ async def convert_file_sync(
 
         # Poll until complete
         poll_interval = 0.5
-        while True:
-            status, _ = await poll_worker_status(coolest_port, task_id)
-            if status == "success":
-                result, error = await get_worker_result(coolest_port, task_id)
-                if error:
-                    raise HTTPException(status_code=500, detail=f"Failed to get result: {error}")
-                logger.info(f"[SYNC] Non-PDF complete")
-                return result
-            elif status == "failure":
-                raise HTTPException(status_code=500, detail="Worker task failed")
-            await asyncio.sleep(poll_interval)
+        try:
+            while True:
+                status, _ = await poll_worker_status(coolest_port, task_id)
+                if status == "success":
+                    result, error = await get_worker_result(coolest_port, task_id)
+                    if error:
+                        raise HTTPException(status_code=500, detail=f"Failed to get result: {error}")
+                    logger.info(f"[SYNC] Non-PDF complete")
+                    return result
+                elif status == "failure":
+                    raise HTTPException(status_code=500, detail="Worker task failed")
+                await asyncio.sleep(poll_interval)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"[SYNC] Worker {coolest_port} unreachable: {e}")
+            raise HTTPException(status_code=502, detail=f"Worker {coolest_port} unreachable: {e}")
 
     # PDF: Get page count
     try:
@@ -1556,16 +1581,22 @@ async def convert_source_sync(
         if error:
             raise HTTPException(status_code=500, detail=f"Worker error: {error}")
 
-        while True:
-            status, _ = await poll_worker_status(coolest_port, task_id)
-            if status == "success":
-                result, error = await get_worker_result(coolest_port, task_id)
-                if error:
-                    raise HTTPException(status_code=500, detail=f"Failed to get result: {error}")
-                return result
-            elif status == "failure":
-                raise HTTPException(status_code=500, detail="Worker task failed")
-            await asyncio.sleep(0.5)
+        try:
+            while True:
+                status, _ = await poll_worker_status(coolest_port, task_id)
+                if status == "success":
+                    result, error = await get_worker_result(coolest_port, task_id)
+                    if error:
+                        raise HTTPException(status_code=500, detail=f"Failed to get result: {error}")
+                    return result
+                elif status == "failure":
+                    raise HTTPException(status_code=500, detail="Worker task failed")
+                await asyncio.sleep(0.5)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"[SOURCE SYNC] Worker {coolest_port} unreachable: {e}")
+            raise HTTPException(status_code=502, detail=f"Worker {coolest_port} unreachable: {e}")
 
     # PDF: Split and wait for all
     try:
@@ -1614,27 +1645,33 @@ async def convert_source_sync(
     start_time = time.time()
     completed_results = {}
 
-    while len(completed_results) < len(task_info):
-        if time.time() - start_time > max_wait:
-            raise HTTPException(status_code=504, detail=f"Conversion timed out after {max_wait}s")
+    try:
+        while len(completed_results) < len(task_info):
+            if time.time() - start_time > max_wait:
+                raise HTTPException(status_code=504, detail=f"Conversion timed out after {max_wait}s")
 
-        for port, task_id, page_range_chunk in task_info:
-            if task_id in completed_results:
-                continue
+            for port, task_id, page_range_chunk in task_info:
+                if task_id in completed_results:
+                    continue
 
-            status, _ = await poll_worker_status(port, task_id)
+                status, _ = await poll_worker_status(port, task_id)
 
-            if status == "success":
-                result, error = await get_worker_result(port, task_id)
-                if result:
-                    completed_results[task_id] = {"pages": page_range_chunk, "result": result}
-                else:
-                    completed_results[task_id] = {"pages": page_range_chunk, "result": {"status": "failure", "errors": [{"message": error}]}}
-            elif status == "failure":
-                completed_results[task_id] = {"pages": page_range_chunk, "result": {"status": "failure", "errors": [{"message": "Worker reported failure"}]}}
+                if status == "success":
+                    result, error = await get_worker_result(port, task_id)
+                    if result:
+                        completed_results[task_id] = {"pages": page_range_chunk, "result": result}
+                    else:
+                        completed_results[task_id] = {"pages": page_range_chunk, "result": {"status": "failure", "errors": [{"message": error}]}}
+                elif status == "failure":
+                    completed_results[task_id] = {"pages": page_range_chunk, "result": {"status": "failure", "errors": [{"message": "Worker reported failure"}]}}
 
-        if len(completed_results) < len(task_info):
-            await asyncio.sleep(0.5)
+            if len(completed_results) < len(task_info):
+                await asyncio.sleep(0.5)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"[SOURCE SYNC] Worker unreachable during polling: {e}")
+        raise HTTPException(status_code=502, detail=f"Worker unreachable: {e}")
 
     # Merge results
     sub_results = list(completed_results.values())
@@ -1699,7 +1736,11 @@ async def poll_status(task_id: str, _: str = Depends(verify_api_key)):
     # Check if this is a chunk task - proxy to worker
     if task_id in chunk_tasks:
         worker_port = chunk_tasks[task_id]
-        status, _ = await poll_worker_status(worker_port, task_id)
+        try:
+            status, _ = await poll_worker_status(worker_port, task_id)
+        except Exception as e:
+            logger.warning(f"[POLL] Worker {worker_port} unreachable for chunk task {task_id}: {e}")
+            status = "failure"
         return {
             "task_id": task_id,
             "task_type": "chunk",
@@ -1743,7 +1784,15 @@ async def poll_status(task_id: str, _: str = Depends(verify_api_key)):
     for sub_job in job.sub_jobs:
         if sub_job.status == JobStatus.IN_PROGRESS and sub_job.worker_task_id:
             # Poll worker for actual status
-            status, _ = await poll_worker_status(sub_job.worker_port, sub_job.worker_task_id)
+            try:
+                status, _ = await poll_worker_status(sub_job.worker_port, sub_job.worker_task_id)
+            except Exception as e:
+                # Worker unreachable - mark sub_job as failed
+                logger.warning(f"[JOB {task_id}] Worker {sub_job.worker_port} unreachable for pages {sub_job.original_pages[0]}-{sub_job.original_pages[1]}: {e}")
+                job_manager.complete_sub_job(sub_job.sub_job_id, error=f"Worker unreachable: {e}")
+                any_failed = True
+                sub_statuses.append({"pages": sub_job.original_pages, "status": "failure"})
+                continue
 
             if status == "success":
                 # Fetch result and mark complete
@@ -1892,184 +1941,6 @@ async def get_result(task_id: str, verbose: bool = False, _: str = Depends(verif
         merged = {**merged, "timings": {}}
 
     return merged
-
-
-# =============================================================================
-# CHUNK ENDPOINTS (proxy to single worker)
-# =============================================================================
-
-async def _proxy_chunk_request(
-    files: UploadFile,
-    endpoint_path: str,
-    api_key: str,
-    is_async: bool = False,
-) -> dict:
-    """Proxy a chunk request to a single worker."""
-    file_bytes = await files.read()
-    filename = files.filename or "document.pdf"
-    is_pdf = filename.lower().endswith(".pdf")
-
-    # Check tier limits
-    limit_error = check_file_limits(file_bytes, api_key, is_pdf=is_pdf)
-    if limit_error:
-        raise HTTPException(status_code=413, detail=limit_error)
-
-    # Get available workers (with detailed logging)
-    available_workers = await get_available_workers(api_key, max_wait=60)
-    if not available_workers:
-        raise HTTPException(status_code=503, detail="No workers available after 60s wait")
-
-    # Use load balancer to pick best worker
-    worker_port = load_balancer.select_single_worker(api_key)
-    if not worker_port:
-        worker_port = available_workers[0]
-
-    logger.info(f"[CHUNK] Proxying {endpoint_path} to worker {worker_port}")
-
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        # Must wrap bytes in BytesIO for httpx async file uploads
-        files_param = {"files": (filename, BytesIO(file_bytes), "application/octet-stream")}
-        resp = await client.post(
-            f"http://127.0.0.1:{worker_port}{endpoint_path}",
-            files=files_param,
-        )
-
-        if resp.status_code != 200:
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
-
-        result = resp.json()
-
-        # For async requests, store task_id -> worker mapping for poll/result
-        if is_async and "task_id" in result:
-            chunk_tasks[result["task_id"]] = worker_port
-            logger.info(f"[CHUNK] Stored mapping: {result['task_id']} -> worker {worker_port}")
-
-        return result
-
-
-# Hierarchical chunking - sync
-@app.post("/v1/chunk/hierarchical/file")
-async def chunk_hierarchical_file(
-    files: UploadFile = File(...),
-    api_key: str = Depends(verify_api_key),
-):
-    """Hierarchical chunking of a document (sync)."""
-    return await _proxy_chunk_request(files, "/v1/chunk/hierarchical/file", api_key)
-
-
-# Hierarchical chunking - async
-@app.post("/v1/chunk/hierarchical/file/async")
-async def chunk_hierarchical_file_async(
-    files: UploadFile = File(...),
-    api_key: str = Depends(verify_api_key),
-):
-    """Hierarchical chunking of a document (async)."""
-    return await _proxy_chunk_request(files, "/v1/chunk/hierarchical/file/async", api_key, is_async=True)
-
-
-# Hybrid chunking - sync
-@app.post("/v1/chunk/hybrid/file")
-async def chunk_hybrid_file(
-    files: UploadFile = File(...),
-    api_key: str = Depends(verify_api_key),
-):
-    """Hybrid chunking of a document (sync)."""
-    return await _proxy_chunk_request(files, "/v1/chunk/hybrid/file", api_key)
-
-
-# Hybrid chunking - async
-@app.post("/v1/chunk/hybrid/file/async")
-async def chunk_hybrid_file_async(
-    files: UploadFile = File(...),
-    api_key: str = Depends(verify_api_key),
-):
-    """Hybrid chunking of a document (async)."""
-    return await _proxy_chunk_request(files, "/v1/chunk/hybrid/file/async", api_key, is_async=True)
-
-
-# -----------------------------------------------------------------------------
-# Source (URL) chunk endpoints - proxy JSON body to worker
-# -----------------------------------------------------------------------------
-
-async def _proxy_chunk_source_request(
-    request: Request,
-    endpoint_path: str,
-    api_key: str,
-    is_async: bool = False,
-) -> dict:
-    """Proxy a chunk source (URL) request to a single worker."""
-    # Get available workers (with detailed logging)
-    available_workers = await get_available_workers(api_key, max_wait=60)
-    if not available_workers:
-        raise HTTPException(status_code=503, detail="No workers available after 60s wait")
-
-    # Use load balancer to pick best worker
-    worker_port = load_balancer.select_single_worker(api_key)
-    if not worker_port:
-        worker_port = available_workers[0]
-
-    logger.info(f"[CHUNK] Proxying source {endpoint_path} to worker {worker_port}")
-
-    # Get JSON body
-    body = await request.json()
-
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        resp = await client.post(
-            f"http://127.0.0.1:{worker_port}{endpoint_path}",
-            json=body,
-        )
-
-        if resp.status_code != 200:
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
-
-        result = resp.json()
-
-        # For async requests, store task_id -> worker mapping for poll/result
-        if is_async and "task_id" in result:
-            chunk_tasks[result["task_id"]] = worker_port
-            logger.info(f"[CHUNK] Stored mapping: {result['task_id']} -> worker {worker_port}")
-
-        return result
-
-
-# Hierarchical source - sync
-@app.post("/v1/chunk/hierarchical/source")
-async def chunk_hierarchical_source(
-    request: Request,
-    api_key: str = Depends(verify_api_key),
-):
-    """Hierarchical chunking from URL source (sync)."""
-    return await _proxy_chunk_source_request(request, "/v1/chunk/hierarchical/source", api_key)
-
-
-# Hierarchical source - async
-@app.post("/v1/chunk/hierarchical/source/async")
-async def chunk_hierarchical_source_async(
-    request: Request,
-    api_key: str = Depends(verify_api_key),
-):
-    """Hierarchical chunking from URL source (async)."""
-    return await _proxy_chunk_source_request(request, "/v1/chunk/hierarchical/source/async", api_key, is_async=True)
-
-
-# Hybrid source - sync
-@app.post("/v1/chunk/hybrid/source")
-async def chunk_hybrid_source(
-    request: Request,
-    api_key: str = Depends(verify_api_key),
-):
-    """Hybrid chunking from URL source (sync)."""
-    return await _proxy_chunk_source_request(request, "/v1/chunk/hybrid/source", api_key)
-
-
-# Hybrid source - async
-@app.post("/v1/chunk/hybrid/source/async")
-async def chunk_hybrid_source_async(
-    request: Request,
-    api_key: str = Depends(verify_api_key),
-):
-    """Hybrid chunking from URL source (async)."""
-    return await _proxy_chunk_source_request(request, "/v1/chunk/hybrid/source/async", api_key, is_async=True)
 
 
 @app.get("/health")

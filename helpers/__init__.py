@@ -36,6 +36,10 @@ from .stats_router import (
 from .result_merger import (
     merge_document_results,
 )
+from .chunk_router import (
+    router as chunk_router,
+    init_router as init_chunk_router,
+)
 
 __all__ = [
     # PDF utils
@@ -66,4 +70,7 @@ __all__ = [
     "init_stats_router",
     # Result merger
     "merge_document_results",
+    # Chunk router
+    "chunk_router",
+    "init_chunk_router",
 ]
