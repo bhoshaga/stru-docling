@@ -28,6 +28,8 @@ async def submit_chunk_with_retry(
     get_workers_for_api_key_func: Callable[[str], List[int]],
     get_worker_id_func: Callable[[int], str],
     workers_dict: Dict[str, dict],
+    image_export_mode: str = "embedded",
+    include_images: bool = True,
 ) -> Tuple[Optional[dict], Optional[str]]:
     """
     Submit chunk with automatic retry on failure.
@@ -53,7 +55,7 @@ async def submit_chunk_with_retry(
     """
     # Initial submission attempt
     result, error = await submit_func(
-        port, chunk_bytes, original_pages, filename, to_formats
+        port, chunk_bytes, original_pages, filename, to_formats, image_export_mode, include_images
     )
 
     if error:
@@ -107,7 +109,7 @@ async def submit_chunk_with_retry(
         if retry_port:
             logger.info(f"[JOB {job_id}] RETRY: Submitting pages {original_pages[0]}-{original_pages[1]} to worker {retry_port}")
             result, error = await submit_func(
-                retry_port, chunk_bytes, original_pages, filename, to_formats
+                retry_port, chunk_bytes, original_pages, filename, to_formats, image_export_mode, include_images
             )
             if error:
                 logger.error(f"[JOB {job_id}] RETRY: Worker {retry_port} also failed: {error}")

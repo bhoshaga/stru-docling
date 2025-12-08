@@ -26,6 +26,8 @@ class JobRequest:
     to_formats: str
     user_range: Optional[Tuple[int, int]] = None
     total_pages: int = 0
+    image_export_mode: str = "embedded"  # embedded, placeholder, referenced
+    include_images: bool = True
     enqueued_at: float = field(default_factory=time.time)
 
 
@@ -182,7 +184,7 @@ async def _process_non_pdf(request: JobRequest, available_workers: List[int]):
     )
 
     # Submit to worker
-    task_id, error = await _submit_to_worker(coolest_port, request.file_bytes, request.filename, request.to_formats)
+    task_id, error = await _submit_to_worker(coolest_port, request.file_bytes, request.filename, request.to_formats, request.image_export_mode, request.include_images)
 
     if error:
         logger.error(f"[QUEUE] Job {job_id}: worker submit error: {error}")
@@ -272,6 +274,8 @@ async def _process_pdf(request: JobRequest, available_workers: List[int]):
             get_workers_for_api_key_func=_get_workers_for_api_key,
             get_worker_id_func=_get_worker_id,
             workers_dict=_workers,
+            image_export_mode=request.image_export_mode,
+            include_images=request.include_images,
         )
 
         if error:

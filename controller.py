@@ -532,21 +532,17 @@ def start_worker_process(port: int) -> int:
 
 
 def get_real_pid_on_port(port: int) -> int | None:
-    """Get the actual PID of the process listening on a port using lsof.
+    """Get the actual PID of the process listening on a port using psutil.
 
     This is the source of truth - more reliable than stored PIDs which can
     become stale (zombie processes, restarts, etc).
+
+    Uses psutil instead of lsof for better container compatibility and performance.
     """
     try:
-        result = subprocess.run(
-            f"lsof -ti :{port}",
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if result.stdout.strip():
-            return int(result.stdout.strip().split()[0])  # First PID if multiple
+        for conn in psutil.net_connections("inet"):
+            if conn.laddr.port == port and conn.status == "LISTEN":
+                return conn.pid
         return None
     except Exception as e:
         logger.warning(f"[PID_CHECK] Failed to get PID on port {port}: {e}")
@@ -766,6 +762,8 @@ async def submit_to_worker(
     pdf_bytes: bytes,
     filename: str = "document.pdf",
     to_formats: str = "json",
+    image_export_mode: str = "embedded",
+    include_images: bool = True,
 ) -> Tuple[Optional[str], Optional[str]]:
     """
     Submit a PDF chunk to a worker.
@@ -774,7 +772,7 @@ async def submit_to_worker(
         (task_id, error) - task_id if successful, error message if failed
     """
     url = f"http://{WORKER_HOST}:{port}/v1/convert/file/async"
-    logger.info(f"Submitting to worker {port}: {len(pdf_bytes)} bytes, format={to_formats}")
+    logger.info(f"Submitting to worker {port}: {len(pdf_bytes)} bytes, format={to_formats}, image_export_mode={image_export_mode}, include_images={include_images}")
 
     # Update worker state and activity when job is submitted
     worker_id = get_worker_id(port)
@@ -787,7 +785,11 @@ async def submit_to_worker(
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SEC) as client:
             # Must wrap bytes in BytesIO for httpx async file uploads
             files = {"files": (filename, BytesIO(pdf_bytes), "application/pdf")}
-            data = {"to_formats": to_formats}
+            data = {
+                "to_formats": to_formats,
+                "image_export_mode": image_export_mode,
+                "include_images": str(include_images).lower(),  # Form data needs string
+            }
 
             response = await client.post(url, files=files, data=data)
 
@@ -889,6 +891,8 @@ async def submit_chunk_with_page_split(
     original_pages: Tuple[int, int],
     filename: str,
     to_formats: str,
+    image_export_mode: str = "embedded",
+    include_images: bool = True,
 ) -> Tuple[Optional[dict], Optional[str]]:
     """
     Submit a chunk by splitting into individual pages, running in parallel on the same worker,
@@ -909,7 +913,7 @@ async def submit_chunk_with_page_split(
 
     # If only 1 page, no split needed - direct submission + poll + get result
     if num_pages == 1:
-        task_id, error = await submit_to_worker(port, chunk_bytes, filename, to_formats)
+        task_id, error = await submit_to_worker(port, chunk_bytes, filename, to_formats, image_export_mode, include_images)
         if error:
             return None, error
 
@@ -961,7 +965,7 @@ async def submit_chunk_with_page_split(
     # Submit all pages in parallel (I/O-bound)
     submit_start = time.time()
     async def submit_single_page(page_bytes: bytes, page_num: int):
-        task_id, error = await submit_to_worker(port, page_bytes, filename, to_formats)
+        task_id, error = await submit_to_worker(port, page_bytes, filename, to_formats, image_export_mode, include_images)
         return (task_id, page_num, error)
 
     submit_tasks = [
@@ -1073,6 +1077,8 @@ async def convert_file_async(
     files: UploadFile = File(...),
     to_formats: str = Form("json"),
     page_range: Optional[List[str]] = Form(None),
+    image_export_mode: str = Form("embedded"),
+    include_images: bool = Form(True),
     api_key: str = Depends(verify_api_key),
 ):
     """
@@ -1144,6 +1150,8 @@ async def convert_file_async(
         to_formats=to_formats,
         user_range=user_range,
         total_pages=total_pages,
+        image_export_mode=image_export_mode,
+        include_images=include_images,
     )
     await enqueue_job(job_request)
 
@@ -1163,6 +1171,8 @@ async def convert_file_sync(
     files: UploadFile = File(...),
     to_formats: str = Form("json"),
     page_range: Optional[List[str]] = Form(None),
+    image_export_mode: str = Form("embedded"),
+    include_images: bool = Form(True),
     api_key: str = Depends(verify_api_key),
 ):
     """
@@ -1197,7 +1207,7 @@ async def convert_file_sync(
         logger.info(f"[SYNC] Non-PDF file, routing to single worker: {coolest_port}")
 
         # Submit to worker
-        task_id, error = await submit_to_worker(coolest_port, file_bytes, filename, to_formats)
+        task_id, error = await submit_to_worker(coolest_port, file_bytes, filename, to_formats, image_export_mode, include_images)
         if error:
             raise HTTPException(status_code=500, detail=f"Worker error: {error}")
 
@@ -1273,7 +1283,7 @@ async def convert_file_sync(
     async def submit_chunk_split(chunk_data: Tuple[bytes, Tuple[int, int]], port: int):
         chunk_bytes, original_pages = chunk_data
         result, error = await submit_chunk_with_page_split(
-            port, chunk_bytes, original_pages, filename, to_formats
+            port, chunk_bytes, original_pages, filename, to_formats, image_export_mode, include_images
         )
         if error:
             logger.warning(f"[SYNC] Chunk {original_pages} failed: {error}")
@@ -1315,22 +1325,24 @@ async def convert_source_async(
 
     Request body should be JSON with:
     - file_id: ID returned from /v1/upload
-    - OR source: URL to fetch document from
+    - OR sources: Array of URLs to fetch documents from (matches worker API)
     - to_formats: Output format (default: "json")
     - page_range: Optional [start, end] for PDF pages
     """
     body = await request.json()
     file_id = body.get("file_id")
-    source_url = body.get("source")
+    sources = body.get("sources")  # Array of URLs, matches worker API
     to_formats = body.get("to_formats", "json")
     page_range = body.get("page_range")
+    image_export_mode = body.get("image_export_mode", "embedded")
+    include_images = body.get("include_images", True)
 
-    if not file_id and not source_url:
-        raise HTTPException(status_code=400, detail="Must provide either file_id or source URL")
+    if not file_id and not sources:
+        raise HTTPException(status_code=400, detail="Must provide either file_id or sources array")
 
-    if source_url:
-        # Proxy to worker for URL source
-        logger.info(f"[SOURCE] Proxying URL source to worker: {source_url}")
+    if sources:
+        # Proxy to worker - pass sources array directly (matches worker API)
+        logger.info(f"[SOURCE] Proxying sources to worker: {sources}")
 
         allowed_ports = get_workers_for_api_key(api_key)
         available_workers = [
@@ -1345,10 +1357,22 @@ async def convert_source_async(
         if not worker_port:
             worker_port = available_workers[0]
 
+        # Pass body directly to worker (sources already in correct format)
+        docling_body = {
+            "sources": sources,
+            "to_formats": body.get("to_formats", ["json"]),
+        }
+        if page_range:
+            docling_body["page_range"] = page_range
+        if image_export_mode != "embedded":
+            docling_body["image_export_mode"] = image_export_mode
+        if not include_images:
+            docling_body["include_images"] = include_images
+
         async with httpx.AsyncClient(timeout=300.0) as client:
             resp = await client.post(
                 f"http://127.0.0.1:{worker_port}/v1/convert/source/async",
-                json=body,
+                json=docling_body,
             )
 
             if resp.status_code != 200:
@@ -1431,6 +1455,8 @@ async def convert_source_async(
         to_formats=to_formats,
         user_range=user_range,
         total_pages=total_pages,
+        image_export_mode=image_export_mode,
+        include_images=include_images,
     )
     await enqueue_job(job_request)
 
@@ -1452,18 +1478,24 @@ async def convert_source_sync(
     """
     Synchronous version of /v1/convert/source/async.
     Blocks until conversion is complete and returns the result.
+
+    Request body should be JSON with:
+    - file_id: ID returned from /v1/upload
+    - OR sources: Array of source objects (e.g. [{"url": "...", "kind": "http"}])
     """
     body = await request.json()
     file_id = body.get("file_id")
-    source_url = body.get("source")
+    sources = body.get("sources")  # Array of source objects, matches worker API
     to_formats = body.get("to_formats", "json")
     page_range = body.get("page_range")
+    image_export_mode = body.get("image_export_mode", "embedded")
+    include_images = body.get("include_images", True)
 
-    if not file_id and not source_url:
-        raise HTTPException(status_code=400, detail="Must provide either file_id or source URL")
+    if not file_id and not sources:
+        raise HTTPException(status_code=400, detail="Must provide either file_id or sources array")
 
-    if source_url:
-        # Proxy to worker for URL source
+    if sources:
+        # Proxy to worker - pass sources array directly (matches worker API)
         allowed_ports = get_workers_for_api_key(api_key)
         available_workers = [
             p for p in allowed_ports
@@ -1477,10 +1509,22 @@ async def convert_source_sync(
         if not worker_port:
             worker_port = available_workers[0]
 
+        # Pass body directly to worker (sources already in correct format)
+        docling_body = {
+            "sources": sources,
+            "to_formats": body.get("to_formats", ["json"]),
+        }
+        if page_range:
+            docling_body["page_range"] = page_range
+        if image_export_mode != "embedded":
+            docling_body["image_export_mode"] = image_export_mode
+        if not include_images:
+            docling_body["include_images"] = include_images
+
         async with httpx.AsyncClient(timeout=600.0) as client:
             resp = await client.post(
                 f"http://127.0.0.1:{worker_port}/v1/convert/source",
-                json=body,
+                json=docling_body,
             )
 
             if resp.status_code != 200:
@@ -1517,7 +1561,7 @@ async def convert_source_sync(
         if not coolest_port:
             coolest_port = available_workers[0]
 
-        task_id, error = await submit_to_worker(coolest_port, file_bytes, filename, to_formats)
+        task_id, error = await submit_to_worker(coolest_port, file_bytes, filename, to_formats, image_export_mode, include_images)
         if error:
             raise HTTPException(status_code=500, detail=f"Worker error: {error}")
 
@@ -1573,7 +1617,7 @@ async def convert_source_sync(
     # Submit all chunks
     async def submit_chunk(chunk_data, port):
         chunk_bytes, original_pages = chunk_data
-        task_id, error = await submit_to_worker(port, chunk_bytes, filename, to_formats)
+        task_id, error = await submit_to_worker(port, chunk_bytes, filename, to_formats, image_export_mode, include_images)
         if error:
             return None
         return (port, task_id, original_pages)
