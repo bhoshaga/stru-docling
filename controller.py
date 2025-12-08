@@ -75,6 +75,7 @@ from helpers import (
     uploaded_files,
     stats_router,
     init_stats_router,
+    merge_document_results,
 )
 
 # =============================================================================
@@ -158,8 +159,8 @@ async def lifespan(app: FastAPI):
                                     "pid": proc.info['pid'],
                                     "port": port,
                                     "state": "ready",
-                                    # Current life stats (reset on worker restart)
-                                    "current_life_pages": restored.get("current_life_pages", 0),
+                                    # Current life stats - always start at 0 (we don't know worker's actual state)
+                                    "current_life_pages": 0,
                                     # Lifetime stats (never reset)
                                     "lifetime_pages": restored.get("lifetime_pages", 0),
                                     "restart_count": restored.get("restart_count", 0),
@@ -411,7 +412,10 @@ def tag_workers_for_restart(allowed_ports: List[int]) -> None:
         if w.get("restart_pending") or w.get("state") == "restarting"
     )
 
+    logger.info(f"[RESTART_TAG] Check: unavailable={unavailable_count}, MAX_UNAVAILABLE={MAX_UNAVAILABLE}, allowed_ports={allowed_ports}")
+
     if unavailable_count >= MAX_UNAVAILABLE:
+        logger.info(f"[RESTART_TAG] Skipping - already at max unavailable")
         return  # Already at max unavailable, don't tag more
 
     # Find workers at page limit that aren't already tagged
@@ -419,15 +423,19 @@ def tag_workers_for_restart(allowed_ports: List[int]) -> None:
     for port in allowed_ports:
         worker_id = get_worker_id(port)
         if worker_id not in workers:
+            logger.info(f"[RESTART_TAG] {worker_id}: not in workers dict")
             continue
         worker = workers[worker_id]
+        pages = worker.get("current_life_pages", 0)
+        logger.info(f"[RESTART_TAG] {worker_id}: pages={pages}, restart_pending={worker.get('restart_pending')}, state={worker.get('state')}, limit={MAX_PAGES_BEFORE_RESTART}")
         if worker.get("restart_pending"):
             continue  # Already tagged
         if worker.get("state") == "restarting":
             continue  # Already restarting
-        if worker.get("current_life_pages", 0) >= MAX_PAGES_BEFORE_RESTART:
+        if pages >= MAX_PAGES_BEFORE_RESTART:
             candidates.append((worker_id, worker))
 
+    logger.info(f"[RESTART_TAG] Candidates: {[c[0] for c in candidates]}")
     if not candidates:
         return  # No workers at limit
 
@@ -901,13 +909,13 @@ async def submit_chunk_with_page_split(
     # Merge results (sorted by page number)
     sorted_results = sorted(completed.values(), key=lambda x: x[0])
 
-    # Build merged result in same format as _merge_document_results expects
+    # Build merged result in same format as merge_document_results expects
     sub_results = [
         {"pages": (pn, pn), "result": result}
         for pn, result in sorted_results
     ]
 
-    merged = _merge_document_results(sub_results, filename)
+    merged = merge_document_results(sub_results, filename)
 
     logger.info(f"[PAGE_SPLIT] Merged {len(sorted_results)} pages into single result")
 
@@ -924,6 +932,53 @@ async def submit_chunk_with_page_split(
 
     # merged already has {document, status, errors, processing_time, timings} format
     return merged, None
+
+
+async def submit_chunk_with_retry(
+    port: int,
+    chunk_bytes: bytes,
+    original_pages: Tuple[int, int],
+    filename: str,
+    to_formats: str,
+    api_key: str,
+    job_id: str,
+) -> Tuple[Optional[dict], Optional[str]]:
+    """
+    Submit chunk with automatic retry on failure.
+
+    If initial submission fails, tries another available worker once.
+    Returns (result, error) - error is None on success.
+    """
+    result, error = await submit_chunk_with_page_split(
+        port, chunk_bytes, original_pages, filename, to_formats
+    )
+
+    if error:
+        logger.warning(f"[JOB {job_id}] Worker {port} failed for pages {original_pages[0]}-{original_pages[1]}: {error}")
+
+        # Find another available worker (ready, not restart_pending, not the failed one)
+        allowed_ports = get_workers_for_api_key(api_key)
+        retry_port = None
+        for p in allowed_ports:
+            if p == port:
+                continue  # Skip failed worker
+            worker_id = get_worker_id(p)
+            if worker_id in workers:
+                w = workers[worker_id]
+                if w.get("state") == "ready" and not w.get("restart_pending"):
+                    retry_port = p
+                    break
+
+        if retry_port:
+            logger.info(f"[JOB {job_id}] RETRY: pages {original_pages[0]}-{original_pages[1]} on worker {retry_port}")
+            result, error = await submit_chunk_with_page_split(
+                retry_port, chunk_bytes, original_pages, filename, to_formats
+            )
+
+        if error:
+            logger.error(f"[JOB {job_id}] FAILED pages {original_pages[0]}-{original_pages[1]} after retry: {error}")
+
+    return result, error
 
 
 # =============================================================================
@@ -959,15 +1014,11 @@ async def convert_file_async(
     if limit_error:
         raise HTTPException(status_code=413, detail=limit_error)
 
-    # Get available workers for this API key
-    allowed_ports = get_workers_for_api_key(api_key)
-    available_workers = [
-        p for p in allowed_ports
-        if get_worker_id(p) in workers and workers[get_worker_id(p)].get("state") == "ready"
-    ]
+    # Get available workers for this API key (calls tag_workers_for_restart)
+    available_workers = await get_available_workers(api_key, max_wait=60)
 
     if not available_workers:
-        raise HTTPException(status_code=503, detail="No workers available")
+        raise HTTPException(status_code=503, detail="No workers available after 60s wait")
 
     # For non-PDF files, route to single coolest worker
     if not is_pdf:
@@ -1064,9 +1115,9 @@ async def convert_file_async(
             original_pages=original_pages,
         )
 
-        # Submit with per-page split (blocks until complete, returns merged result)
-        result, error = await submit_chunk_with_page_split(
-            port, chunk_bytes, original_pages, filename, to_formats
+        # Submit with retry on failure
+        result, error = await submit_chunk_with_retry(
+            port, chunk_bytes, original_pages, filename, to_formats, api_key, job.job_id
         )
 
         if error:
@@ -1079,20 +1130,25 @@ async def convert_file_async(
         return True
 
     # Submit all chunks in parallel (each internally splits into pages)
+    # Update page counts NOW at assignment time (not after completion)
+    # This ensures tag_workers_for_restart() sees accurate counts when new jobs arrive
     tasks = []
     for i, (chunk, port) in enumerate(zip(chunks, available_workers)):
+        chunk_bytes, page_range = chunk
+        pages_for_worker = page_range[1] - page_range[0] + 1
+        worker_id = get_worker_id(port)
+        if worker_id in workers:
+            workers[worker_id]["current_life_pages"] = workers[worker_id].get("current_life_pages", 0) + pages_for_worker
+            workers[worker_id]["lifetime_pages"] = workers[worker_id].get("lifetime_pages", 0) + pages_for_worker
+            # Tag for restart if exceeded limit during this assignment
+            if workers[worker_id]["current_life_pages"] >= MAX_PAGES_BEFORE_RESTART and not workers[worker_id].get("restart_pending"):
+                workers[worker_id]["restart_pending"] = True
+                logger.info(f"[JOB {job.job_id}] {worker_id} tagged for restart (pages={workers[worker_id]['current_life_pages']} >= {MAX_PAGES_BEFORE_RESTART})")
+            load_balancer.update_worker(port, workers[worker_id])
+            logger.info(f"[JOB {job.job_id}] Assigned {pages_for_worker} pages to {worker_id}, life_pages now {workers[worker_id]['current_life_pages']}")
         tasks.append(submit_chunk(chunk, port))
 
     await asyncio.gather(*tasks)
-
-    # Update worker page counts (both current life and lifetime)
-    for port in available_workers[:len(chunks)]:
-        worker_id = get_worker_id(port)
-        if worker_id in workers:
-            pages_for_worker = pages_to_process // len(chunks)
-            workers[worker_id]["current_life_pages"] = workers[worker_id].get("current_life_pages", 0) + pages_for_worker
-            workers[worker_id]["lifetime_pages"] = workers[worker_id].get("lifetime_pages", 0) + pages_for_worker
-            load_balancer.update_worker(port, workers[worker_id])
 
     return {
         "task_id": job.job_id,  # Use parent job_id as task_id for client
@@ -1100,149 +1156,6 @@ async def convert_file_async(
         "total_pages": pages_to_process,
         "workers_used": len(chunks),
     }
-
-
-def _merge_document_results(sub_results: List[dict], filename: str) -> dict:
-    """
-    Merge document results from multiple workers into a single response.
-
-    Args:
-        sub_results: List of (page_range, result) from each worker
-        filename: Original filename
-
-    Returns:
-        Merged ConvertDocumentResponse matching docling-serve format
-    """
-    if not sub_results:
-        return {
-            "document": {"filename": filename},
-            "status": "failure",
-            "errors": [{"message": "No results to merge"}],
-            "processing_time": 0,
-            "timings": {},
-        }
-
-    # Sort sub_results by page range start
-    sorted_results = sorted(sub_results, key=lambda x: x["pages"][0])
-
-    # Initialize merged document
-    merged_doc = {
-        "filename": filename,
-        "md_content": None,
-        "json_content": None,
-        "html_content": None,
-        "text_content": None,
-        "doctags_content": None,
-    }
-
-    total_time = 0
-    all_errors = []
-    all_timings = {}
-    has_success = False
-
-    # Track content to merge
-    md_parts = []
-    html_parts = []
-    text_parts = []
-    doctags_parts = []
-    json_contents = []
-
-    for item in sorted_results:
-        result = item.get("result", {})
-        doc = result.get("document", {})
-
-        # Track status
-        if result.get("status") == "success":
-            has_success = True
-
-        # Aggregate times and errors
-        total_time += result.get("processing_time", 0)
-        all_errors.extend(result.get("errors", []))
-
-        # Merge timings
-        for k, v in result.get("timings", {}).items():
-            if k not in all_timings:
-                all_timings[k] = v
-
-        # Collect string content
-        if doc.get("md_content"):
-            md_parts.append(doc["md_content"])
-        if doc.get("html_content"):
-            html_parts.append(doc["html_content"])
-        if doc.get("text_content"):
-            text_parts.append(doc["text_content"])
-        if doc.get("doctags_content"):
-            doctags_parts.append(doc["doctags_content"])
-        if doc.get("json_content"):
-            json_contents.append((item["pages"], doc["json_content"]))
-
-    # Merge string content (simple concatenation)
-    if md_parts:
-        merged_doc["md_content"] = "\n\n".join(md_parts)
-    if html_parts:
-        merged_doc["html_content"] = "\n".join(html_parts)
-    if text_parts:
-        merged_doc["text_content"] = "\n\n".join(text_parts)
-    if doctags_parts:
-        merged_doc["doctags_content"] = "\n".join(doctags_parts)
-
-    # Merge JSON content (more complex)
-    if json_contents:
-        merged_doc["json_content"] = _merge_json_content(json_contents, filename)
-
-    return {
-        "document": merged_doc,
-        "status": "success" if has_success else "failure",
-        "errors": all_errors,
-        "processing_time": total_time,
-        "timings": all_timings,
-    }
-
-
-def _merge_json_content(json_contents: List[Tuple[tuple, dict]], filename: str) -> dict:
-    """
-    Merge json_content from multiple workers.
-
-    Args:
-        json_contents: List of ((start_page, end_page), json_content) tuples
-
-    Note: docling-serve returns page numbers relative to each chunk (1, 2, 3...)
-    not the original PDF page numbers. We need to renumber them.
-    """
-    if not json_contents:
-        return None
-
-    # Use first chunk as base
-    first_range, first_jc = json_contents[0]
-    base = first_jc.copy()
-
-    # Lists to concatenate
-    list_keys = ["groups", "texts", "pictures", "tables", "key_value_items", "form_items"]
-
-    # Renumber pages from first chunk to original page numbers
-    merged_pages = {}
-    for rel_page_str, page_data in first_jc.get("pages", {}).items():
-        rel_page = int(rel_page_str)
-        # Convert relative page (1, 2, ...) to original page number
-        original_page = first_range[0] + rel_page - 1
-        merged_pages[str(original_page)] = page_data
-
-    # Merge lists and pages from subsequent chunks
-    for page_range, jc in json_contents[1:]:
-        # Merge list contents
-        for key in list_keys:
-            if key in base and key in jc:
-                base[key] = base.get(key, []) + jc.get(key, [])
-
-        # Merge pages with renumbering
-        for rel_page_str, page_data in jc.get("pages", {}).items():
-            rel_page = int(rel_page_str)
-            # Convert relative page to original page number
-            original_page = page_range[0] + rel_page - 1
-            merged_pages[str(original_page)] = page_data
-
-    base["pages"] = merged_pages
-    return base
 
 
 @app.post("/v1/convert/file")
@@ -1362,7 +1275,7 @@ async def convert_file_sync(
             pages_for_worker = pages_to_process // len(chunks)
             workers[worker_id]["current_life_pages"] = workers[worker_id].get("current_life_pages", 0) + pages_for_worker
             workers[worker_id]["lifetime_pages"] = workers[worker_id].get("lifetime_pages", 0) + pages_for_worker
-    merged = _merge_document_results(sub_results, filename)
+    merged = merge_document_results(sub_results, filename)
 
     logger.info(f"[SYNC] Complete: {len(sub_results)} chunks merged, status={merged['status']}")
 
@@ -1535,9 +1448,9 @@ async def convert_source_async(
             worker_port=port,
             original_pages=original_pages,
         )
-        # Use per-page split (blocks until complete, returns merged result)
-        result, error = await submit_chunk_with_page_split(
-            port, chunk_bytes, original_pages, filename, to_formats
+        # Submit with retry on failure
+        result, error = await submit_chunk_with_retry(
+            port, chunk_bytes, original_pages, filename, to_formats, api_key, job.job_id
         )
         if error:
             job_manager.complete_sub_job(sub_job.sub_job_id, error=error)
@@ -1725,7 +1638,7 @@ async def convert_source_sync(
 
     # Merge results
     sub_results = list(completed_results.values())
-    return _merge_document_results(sub_results, filename)
+    return merge_document_results(sub_results, filename)
 
 
 def _aggregate_job_results(job) -> dict:
@@ -1772,7 +1685,7 @@ def _build_merged_result(job) -> dict:
             })
 
     # Use the same merge logic as sync endpoint
-    return _merge_document_results(sub_results, job.filename)
+    return merge_document_results(sub_results, job.filename)
 
 
 @app.get("/v1/status/poll/{task_id}")
@@ -1910,9 +1823,13 @@ async def poll_status(task_id: str, _: str = Depends(verify_api_key)):
 
 
 @app.get("/v1/result/{task_id}")
-async def get_result(task_id: str, _: str = Depends(verify_api_key)):
+async def get_result(task_id: str, verbose: bool = False, _: str = Depends(verify_api_key)):
     """
     Get job result in standard docling-serve format.
+
+    Args:
+        task_id: The job/task ID
+        verbose: If true, include detailed per-page timing breakdown
 
     Returns the same format as a single worker would return.
     Falls back to disk storage if not in memory.
@@ -1934,10 +1851,22 @@ async def get_result(task_id: str, _: str = Depends(verify_api_key)):
         # Handle backward compat: old format has "sub_results", new format has "document"
         if "sub_results" in disk_result and "document" not in disk_result:
             # Old format - convert to merged format
-            merged = _merge_document_results(disk_result["sub_results"], disk_result.get("filename", "document.pdf"))
+            merged = merge_document_results(disk_result["sub_results"], disk_result.get("filename", "document.pdf"))
             # Update disk with new format
             result_storage.save_result(task_id, merged)
-            return merged
+            disk_result = merged
+
+        # Save detailed timings if not already saved
+        timings_data = disk_result.get("timings")
+        existing_timings = result_storage.get_job_timings(task_id)
+        logger.info(f"[TIMINGS] task={task_id}, has_timings={bool(timings_data)}, existing={bool(existing_timings)}")
+        if timings_data and not existing_timings:
+            save_result = result_storage.save_job_timings(task_id, timings_data)
+            logger.info(f"[TIMINGS] Saved timings for {task_id}: {save_result}")
+
+        # Strip detailed timings unless verbose
+        if not verbose and "timings" in disk_result:
+            disk_result = {**disk_result, "timings": {}}
         return disk_result
 
     job = job_manager.get_job(task_id)
@@ -1951,8 +1880,16 @@ async def get_result(task_id: str, _: str = Depends(verify_api_key)):
     # Build merged result in standard docling-serve format
     merged = _build_merged_result(job)
 
+    # Save detailed timings to stats
+    if merged.get("timings"):
+        result_storage.save_job_timings(task_id, merged["timings"])
+
     # Save to disk for persistence
     result_storage.save_result(task_id, merged)
+
+    # Strip detailed timings unless verbose
+    if not verbose:
+        merged = {**merged, "timings": {}}
 
     return merged
 

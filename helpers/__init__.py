@@ -33,6 +33,9 @@ from .stats_router import (
     router as stats_router,
     init_router as init_stats_router,
 )
+from .result_merger import (
+    merge_document_results,
+)
 
 __all__ = [
     # PDF utils
@@ -61,4 +64,6 @@ __all__ = [
     # Stats router
     "stats_router",
     "init_stats_router",
+    # Result merger
+    "merge_document_results",
 ]
