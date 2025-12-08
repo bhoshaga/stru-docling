@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 from helpers import (
     get_page_count,
     split_pdf_for_workers,
+    extract_pages,
     job_manager,
     JobStatus,
     load_balancer,
@@ -83,6 +84,7 @@ from helpers import (
 # Watchdog settings
 MAX_PAGES_BEFORE_RESTART = int(os.environ.get("MAX_PAGES_BEFORE_RESTART", "10"))
 MAX_MEMORY_MB = int(os.environ.get("MAX_MEMORY_MB", "12000"))
+MAX_UNAVAILABLE = int(os.environ.get("MAX_UNAVAILABLE", "1"))  # Max workers that can be down at once
 REQUEST_TIMEOUT_SEC = int(os.environ.get("REQUEST_TIMEOUT_SEC", "600"))
 IDLE_RESTART_SEC = int(os.environ.get("IDLE_RESTART_SEC", "3600"))
 JOB_TIMEOUT_SEC = int(os.environ.get("JOB_TIMEOUT_SEC", "600"))  # 10 minutes
@@ -168,6 +170,8 @@ async def lifespan(app: FastAPI):
                                     "current_job_id": None,
                                     "started_at": restored.get("started_at", time.time()),
                                     "memory_mb": 0,
+                                    # Restart coordination
+                                    "restart_pending": False,
                                 }
                                 load_balancer.register_worker(port, workers[worker_id])
                                 logger.info(f"[CONTROLLER] Found worker {worker_id} on port {port}, pid={proc.info['pid']}")
@@ -326,6 +330,117 @@ def get_port_from_worker_id(worker_id: str) -> int:
     """Get port from worker ID."""
     num = int(worker_id.split("_")[1])
     return MIN_PORT + num - 1
+
+
+async def get_available_workers(api_key: str, max_wait: int = 60) -> List[int]:
+    """
+    Get available workers for an API key with detailed logging.
+
+    Workers are available if:
+    - They exist in the workers dict
+    - Their state is "ready" (not "processing" or "restarting")
+    - They are NOT tagged for restart (restart_pending=False)
+
+    Before selecting, tags workers at page limit for restart (respecting MAX_UNAVAILABLE).
+
+    Returns list of available worker ports.
+    """
+    allowed_ports = get_workers_for_api_key(api_key)
+    wait_start = time.time()
+
+    while time.time() - wait_start < max_wait:
+        # Tag workers at page limit for restart (respects MAX_UNAVAILABLE)
+        tag_workers_for_restart(allowed_ports)
+
+        available = []
+        unavailable_reasons = []
+
+        for port in allowed_ports:
+            worker_id = get_worker_id(port)
+            if worker_id not in workers:
+                unavailable_reasons.append(f"{worker_id}: not registered")
+                continue
+
+            worker = workers[worker_id]
+            state = worker.get("state", "unknown")
+            pages = worker.get("current_life_pages", 0)
+            restart_pending = worker.get("restart_pending", False)
+
+            if restart_pending:
+                unavailable_reasons.append(f"{worker_id}: restart_pending (pages={pages})")
+            elif state == "ready":
+                available.append(port)
+            else:
+                unavailable_reasons.append(f"{worker_id}: state={state}, pages={pages}")
+
+        if available:
+            # Log summary of available workers
+            available_info = []
+            for port in available:
+                w = workers[get_worker_id(port)]
+                available_info.append(f"{get_worker_id(port)}(pages={w.get('current_life_pages', 0)})")
+            logger.info(f"[WORKERS] Available: {', '.join(available_info)}")
+            if unavailable_reasons:
+                logger.info(f"[WORKERS] Unavailable: {', '.join(unavailable_reasons)}")
+            return available
+
+        # No workers available - log why and wait
+        logger.info(f"[WORKERS] None available, waiting... ({time.time() - wait_start:.0f}s)")
+        for reason in unavailable_reasons:
+            logger.info(f"[WORKERS]   {reason}")
+        await asyncio.sleep(2)
+
+    # Timeout - log final state
+    logger.warning(f"[WORKERS] Timeout after {max_wait}s, no workers available")
+    return []
+
+
+def tag_workers_for_restart(allowed_ports: List[int]) -> None:
+    """
+    Tag workers that have reached page limit for restart.
+
+    Called during job assignment to coordinate restarts with MAX_UNAVAILABLE.
+    Tags highest-memory worker at limit, respecting MAX_UNAVAILABLE cap.
+
+    Tagged workers are excluded from job assignment and will be restarted
+    by the watchdog when they become idle (state="ready").
+    """
+    # Count currently tagged/restarting workers (unavailable)
+    unavailable_count = sum(
+        1 for w in workers.values()
+        if w.get("restart_pending") or w.get("state") == "restarting"
+    )
+
+    if unavailable_count >= MAX_UNAVAILABLE:
+        return  # Already at max unavailable, don't tag more
+
+    # Find workers at page limit that aren't already tagged
+    candidates = []
+    for port in allowed_ports:
+        worker_id = get_worker_id(port)
+        if worker_id not in workers:
+            continue
+        worker = workers[worker_id]
+        if worker.get("restart_pending"):
+            continue  # Already tagged
+        if worker.get("state") == "restarting":
+            continue  # Already restarting
+        if worker.get("current_life_pages", 0) >= MAX_PAGES_BEFORE_RESTART:
+            candidates.append((worker_id, worker))
+
+    if not candidates:
+        return  # No workers at limit
+
+    # Sort by memory (highest first) - memory is the critical resource
+    candidates.sort(key=lambda x: x[1].get("memory_mb", 0), reverse=True)
+
+    # Tag workers up to MAX_UNAVAILABLE
+    for worker_id, worker in candidates:
+        if unavailable_count >= MAX_UNAVAILABLE:
+            break
+        worker["restart_pending"] = True
+        unavailable_count += 1
+        logger.info(f"[RESTART_TAG] {worker_id}: tagged for restart (pages={worker.get('current_life_pages', 0)}, memory={worker.get('memory_mb', 0):.0f}MB, unavailable={unavailable_count}/{MAX_UNAVAILABLE})")
 
 
 def get_worker_cmd(port: int) -> list[str]:
@@ -499,6 +614,8 @@ async def restart_worker(worker_id: str, reason: str = "manual"):
         "current_job_id": None,
         "started_at": time.time(),
         "memory_mb": 0,
+        # Restart coordination - clear the tag
+        "restart_pending": False,
     }
 
     # Wait for worker to be ready (max 60s)
@@ -657,6 +774,158 @@ async def get_worker_result(port: int, task_id: str) -> Tuple[Optional[dict], Op
         return None, str(e)
 
 
+# Thread pool for CPU-bound PDF operations
+_pdf_executor = ThreadPoolExecutor(max_workers=4)
+
+
+async def submit_chunk_with_page_split(
+    port: int,
+    chunk_bytes: bytes,
+    original_pages: Tuple[int, int],
+    filename: str,
+    to_formats: str,
+) -> Tuple[Optional[dict], Optional[str]]:
+    """
+    Submit a chunk by splitting into individual pages, running in parallel on the same worker,
+    then merging results. Transparent to caller - looks like single chunk submission.
+
+    Args:
+        port: Worker port
+        chunk_bytes: PDF bytes for this chunk
+        original_pages: (start_page, end_page) 1-indexed
+        filename: Original filename
+        to_formats: Output format
+
+    Returns:
+        (merged_result, error) - merged result if successful, error message if failed
+    """
+    start_page, end_page = original_pages
+    num_pages = end_page - start_page + 1
+
+    # If only 1 page, no split needed - direct submission + poll + get result
+    if num_pages == 1:
+        task_id, error = await submit_to_worker(port, chunk_bytes, filename, to_formats)
+        if error:
+            return None, error
+
+        # Poll until complete
+        while True:
+            status, _ = await poll_worker_status(port, task_id)
+            if status == "success":
+                result, err = await get_worker_result(port, task_id)
+                # Set worker state back to ready
+                worker_id = get_worker_id(port)
+                if worker_id in workers:
+                    workers[worker_id]["state"] = "ready"
+                    workers[worker_id]["last_activity"] = time.time()
+                    load_balancer.update_worker(port, workers[worker_id])
+                return result, err
+            elif status == "failure":
+                # Set worker state back to ready even on failure
+                worker_id = get_worker_id(port)
+                if worker_id in workers:
+                    workers[worker_id]["state"] = "ready"
+                    load_balancer.update_worker(port, workers[worker_id])
+                return None, f"Worker task {task_id} failed"
+            await asyncio.sleep(0.3)
+
+    # Multiple pages: split, submit all, poll all, merge
+    logger.info(f"[PAGE_SPLIT] Splitting {num_pages} pages for worker {port} (pages {start_page}-{end_page})")
+
+    # Extract each page in parallel using ThreadPoolExecutor (CPU-bound)
+    loop = asyncio.get_event_loop()
+    extract_tasks = [
+        loop.run_in_executor(_pdf_executor, extract_pages, chunk_bytes, i + 1, i + 1)
+        for i in range(num_pages)
+    ]
+    try:
+        page_bytes_list = await asyncio.gather(*extract_tasks)
+    except Exception as e:
+        logger.error(f"[PAGE_SPLIT] Failed to extract pages: {e}")
+        return None, f"Page extraction failed: {e}"
+
+    logger.info(f"[PAGE_SPLIT] Extracted {len(page_bytes_list)} pages, submitting to worker {port}...")
+
+    # Submit all pages in parallel (I/O-bound)
+    async def submit_single_page(page_bytes: bytes, page_num: int):
+        task_id, error = await submit_to_worker(port, page_bytes, filename, to_formats)
+        return (task_id, page_num, error)
+
+    submit_tasks = [
+        submit_single_page(pb, start_page + i)
+        for i, pb in enumerate(page_bytes_list)
+    ]
+    submissions = await asyncio.gather(*submit_tasks)
+
+    # Check for submission failures
+    successful_submissions = [(tid, pn) for tid, pn, err in submissions if tid and not err]
+    failed_submissions = [(pn, err) for tid, pn, err in submissions if err]
+
+    if failed_submissions:
+        logger.warning(f"[PAGE_SPLIT] {len(failed_submissions)} pages failed to submit: {failed_submissions}")
+
+    if not successful_submissions:
+        return None, "All page submissions failed"
+
+    logger.info(f"[PAGE_SPLIT] Submitted {len(successful_submissions)} pages, polling...")
+
+    # Poll all tasks until complete
+    pending = {tid: pn for tid, pn in successful_submissions}
+    completed = {}  # task_id -> (page_num, result)
+    max_wait = 300  # 5 minutes
+    start_time = time.time()
+
+    while pending and (time.time() - start_time) < max_wait:
+        for task_id in list(pending.keys()):
+            status, _ = await poll_worker_status(port, task_id)
+            if status == "success":
+                result, err = await get_worker_result(port, task_id)
+                if result:
+                    completed[task_id] = (pending[task_id], result)
+                del pending[task_id]
+            elif status == "failure":
+                logger.warning(f"[PAGE_SPLIT] Page {pending[task_id]} failed")
+                del pending[task_id]
+
+        if pending:
+            await asyncio.sleep(0.3)
+
+    if pending:
+        logger.warning(f"[PAGE_SPLIT] Timeout waiting for {len(pending)} pages")
+
+    if not completed:
+        return None, "No pages completed successfully"
+
+    logger.info(f"[PAGE_SPLIT] {len(completed)} pages completed, merging...")
+
+    # Merge results (sorted by page number)
+    sorted_results = sorted(completed.values(), key=lambda x: x[0])
+
+    # Build merged result in same format as _merge_document_results expects
+    sub_results = [
+        {"pages": (pn, pn), "result": result}
+        for pn, result in sorted_results
+    ]
+
+    merged = _merge_document_results(sub_results, filename)
+
+    logger.info(f"[PAGE_SPLIT] Merged {len(sorted_results)} pages into single result")
+
+    # Set worker state back to ready
+    worker_id = get_worker_id(port)
+    logger.info(f"[PAGE_SPLIT] Setting {worker_id} (port {port}) back to ready, in_workers={worker_id in workers}")
+    if worker_id in workers:
+        workers[worker_id]["state"] = "ready"
+        workers[worker_id]["last_activity"] = time.time()
+        load_balancer.update_worker(port, workers[worker_id])
+        logger.info(f"[PAGE_SPLIT] {worker_id} state now: {workers[worker_id]['state']}")
+    else:
+        logger.warning(f"[PAGE_SPLIT] {worker_id} not found in workers dict!")
+
+    # merged already has {document, status, errors, processing_time, timings} format
+    return merged, None
+
+
 # =============================================================================
 # DOCLING API ENDPOINTS (Load Balanced)
 # =============================================================================
@@ -782,7 +1051,7 @@ async def convert_file_async(
         logger.error(f"Error splitting PDF: {e}")
         raise HTTPException(status_code=500, detail=f"Error splitting PDF: {e}")
 
-    # Create sub-jobs and submit to workers
+    # Create sub-jobs and submit to workers with per-page splitting
     job_manager.start_job(job.job_id)
 
     async def submit_chunk(chunk_data: Tuple[bytes, Tuple[int, int]], port: int):
@@ -795,18 +1064,21 @@ async def convert_file_async(
             original_pages=original_pages,
         )
 
-        # Submit to worker
-        task_id, error = await submit_to_worker(port, chunk_bytes, filename, to_formats)
+        # Submit with per-page split (blocks until complete, returns merged result)
+        result, error = await submit_chunk_with_page_split(
+            port, chunk_bytes, original_pages, filename, to_formats
+        )
 
         if error:
             job_manager.complete_sub_job(sub_job.sub_job_id, error=error)
             return False
 
-        # Register worker task
-        job_manager.register_worker_task(sub_job.sub_job_id, task_id)
+        # Complete sub_job with merged result immediately
+        job_manager.complete_sub_job(sub_job.sub_job_id, result=result)
+        logger.info(f"[JOB {job.job_id}] Worker {port} completed pages {original_pages[0]}-{original_pages[1]}")
         return True
 
-    # Submit all chunks in parallel
+    # Submit all chunks in parallel (each internally splits into pages)
     tasks = []
     for i, (chunk, port) in enumerate(zip(chunks, available_workers)):
         tasks.append(submit_chunk(chunk, port))
@@ -998,15 +1270,10 @@ async def convert_file_sync(
     if limit_error:
         raise HTTPException(status_code=413, detail=limit_error)
 
-    # Get available workers
-    allowed_ports = get_workers_for_api_key(api_key)
-    available_workers = [
-        p for p in allowed_ports
-        if get_worker_id(p) in workers and workers[get_worker_id(p)].get("state") == "ready"
-    ]
-
+    # Get available workers (with detailed logging)
+    available_workers = await get_available_workers(api_key, max_wait=60)
     if not available_workers:
-        raise HTTPException(status_code=503, detail="No workers available")
+        raise HTTPException(status_code=503, detail="No workers available after 60s wait")
 
     # For non-PDF files, route to single coolest worker
     if not is_pdf:
@@ -1070,28 +1337,23 @@ async def convert_file_sync(
         logger.error(f"[SYNC] Error splitting PDF: {e}")
         raise HTTPException(status_code=500, detail=f"Error splitting PDF: {e}")
 
-    # Submit chunks to workers and collect task IDs
-    task_info = []  # List of (port, task_id, page_range)
-
-    async def submit_chunk(chunk_data: Tuple[bytes, Tuple[int, int]], port: int):
+    # Submit chunks to workers with per-page splitting (parallel within each worker)
+    async def submit_chunk_split(chunk_data: Tuple[bytes, Tuple[int, int]], port: int):
         chunk_bytes, original_pages = chunk_data
-        task_id, error = await submit_to_worker(port, chunk_bytes, filename, to_formats)
+        result, error = await submit_chunk_with_page_split(
+            port, chunk_bytes, original_pages, filename, to_formats
+        )
         if error:
-            return None
-        return (port, task_id, original_pages)
+            logger.warning(f"[SYNC] Chunk {original_pages} failed: {error}")
+            return {"pages": original_pages, "result": {"status": "failure", "errors": [{"message": error}]}}
+        return {"pages": original_pages, "result": result}
 
-    # Submit all chunks in parallel
-    tasks = []
-    for chunk, port in zip(chunks, available_workers):
-        tasks.append(submit_chunk(chunk, port))
+    # Submit all chunks in parallel (each chunk internally splits into pages)
+    logger.info(f"[SYNC] Submitting {len(chunks)} chunks with per-page splitting...")
+    tasks = [submit_chunk_split(chunk, port) for chunk, port in zip(chunks, available_workers)]
+    sub_results = await asyncio.gather(*tasks)
 
-    results = await asyncio.gather(*tasks)
-    task_info = [r for r in results if r is not None]
-
-    if not task_info:
-        raise HTTPException(status_code=500, detail="Failed to submit to any worker")
-
-    logger.info(f"[SYNC] Submitted to {len(task_info)} workers, polling...")
+    logger.info(f"[SYNC] All {len(sub_results)} chunks completed")
 
     # Update worker page counts (both current life and lifetime)
     for port in available_workers[:len(chunks)]:
@@ -1100,50 +1362,6 @@ async def convert_file_sync(
             pages_for_worker = pages_to_process // len(chunks)
             workers[worker_id]["current_life_pages"] = workers[worker_id].get("current_life_pages", 0) + pages_for_worker
             workers[worker_id]["lifetime_pages"] = workers[worker_id].get("lifetime_pages", 0) + pages_for_worker
-
-    # Poll until all complete (with timeout)
-    max_wait = 600  # 10 minutes
-    poll_interval = 0.5
-    start_time = time.time()
-    completed_results = {}  # task_id -> result
-
-    while len(completed_results) < len(task_info):
-        if time.time() - start_time > max_wait:
-            raise HTTPException(
-                status_code=504,
-                detail=f"Conversion timed out after {max_wait}s"
-            )
-
-        for port, task_id, page_range in task_info:
-            if task_id in completed_results:
-                continue
-
-            status, _ = await poll_worker_status(port, task_id)
-
-            if status == "success":
-                result, error = await get_worker_result(port, task_id)
-                if result:
-                    completed_results[task_id] = {
-                        "pages": page_range,
-                        "result": result,
-                    }
-                    logger.info(f"[SYNC] Task {task_id[:8]} completed")
-                else:
-                    completed_results[task_id] = {
-                        "pages": page_range,
-                        "result": {"status": "failure", "errors": [{"message": error}]},
-                    }
-            elif status == "failure":
-                completed_results[task_id] = {
-                    "pages": page_range,
-                    "result": {"status": "failure", "errors": [{"message": "Worker reported failure"}]},
-                }
-
-        if len(completed_results) < len(task_info):
-            await asyncio.sleep(poll_interval)
-
-    # Merge results
-    sub_results = list(completed_results.values())
     merged = _merge_document_results(sub_results, filename)
 
     logger.info(f"[SYNC] Complete: {len(sub_results)} chunks merged, status={merged['status']}")
@@ -1234,15 +1452,10 @@ async def convert_source_async(
     if limit_error:
         raise HTTPException(status_code=413, detail=limit_error)
 
-    # Get available workers
-    allowed_ports = get_workers_for_api_key(api_key)
-    available_workers = [
-        p for p in allowed_ports
-        if get_worker_id(p) in workers and workers[get_worker_id(p)].get("state") == "ready"
-    ]
-
+    # Get available workers (with detailed logging)
+    available_workers = await get_available_workers(api_key, max_wait=60)
     if not available_workers:
-        raise HTTPException(status_code=503, detail="No workers available")
+        raise HTTPException(status_code=503, detail="No workers available after 60s wait")
 
     # Non-PDF: single worker
     if not is_pdf:
@@ -1322,11 +1535,15 @@ async def convert_source_async(
             worker_port=port,
             original_pages=original_pages,
         )
-        task_id, error = await submit_to_worker(port, chunk_bytes, filename, to_formats)
+        # Use per-page split (blocks until complete, returns merged result)
+        result, error = await submit_chunk_with_page_split(
+            port, chunk_bytes, original_pages, filename, to_formats
+        )
         if error:
             job_manager.complete_sub_job(sub_job.sub_job_id, error=error)
             return False
-        job_manager.register_worker_task(sub_job.sub_job_id, task_id)
+        job_manager.complete_sub_job(sub_job.sub_job_id, result=result)
+        logger.info(f"[JOB {job.job_id}] Worker {port} completed pages {original_pages[0]}-{original_pages[1]}")
         return True
 
     tasks = [submit_chunk(chunk, port) for chunk, port in zip(chunks, available_workers)]
@@ -1411,15 +1628,10 @@ async def convert_source_sync(
     filename = upload_info["filename"]
     is_pdf = filename.lower().endswith(".pdf")
 
-    # Get available workers
-    allowed_ports = get_workers_for_api_key(api_key)
-    available_workers = [
-        p for p in allowed_ports
-        if get_worker_id(p) in workers and workers[get_worker_id(p)].get("state") == "ready"
-    ]
-
+    # Get available workers (with detailed logging)
+    available_workers = await get_available_workers(api_key, max_wait=60)
     if not available_workers:
-        raise HTTPException(status_code=503, detail="No workers available")
+        raise HTTPException(status_code=503, detail="No workers available after 60s wait")
 
     # Non-PDF: single worker
     if not is_pdf:
@@ -1765,15 +1977,10 @@ async def _proxy_chunk_request(
     if limit_error:
         raise HTTPException(status_code=413, detail=limit_error)
 
-    # Get available workers
-    allowed_ports = get_workers_for_api_key(api_key)
-    available_workers = [
-        p for p in allowed_ports
-        if get_worker_id(p) in workers and workers[get_worker_id(p)].get("state") == "ready"
-    ]
-
+    # Get available workers (with detailed logging)
+    available_workers = await get_available_workers(api_key, max_wait=60)
     if not available_workers:
-        raise HTTPException(status_code=503, detail="No workers available")
+        raise HTTPException(status_code=503, detail="No workers available after 60s wait")
 
     # Use load balancer to pick best worker
     worker_port = load_balancer.select_single_worker(api_key)
@@ -1854,15 +2061,10 @@ async def _proxy_chunk_source_request(
     is_async: bool = False,
 ) -> dict:
     """Proxy a chunk source (URL) request to a single worker."""
-    # Get available workers
-    allowed_ports = get_workers_for_api_key(api_key)
-    available_workers = [
-        p for p in allowed_ports
-        if get_worker_id(p) in workers and workers[get_worker_id(p)].get("state") == "ready"
-    ]
-
+    # Get available workers (with detailed logging)
+    available_workers = await get_available_workers(api_key, max_wait=60)
     if not available_workers:
-        raise HTTPException(status_code=503, detail="No workers available")
+        raise HTTPException(status_code=503, detail="No workers available after 60s wait")
 
     # Use load balancer to pick best worker
     worker_port = load_balancer.select_single_worker(api_key)
@@ -2119,7 +2321,7 @@ async def watchdog():
             for worker_id, worker in list(workers.items()):
                 pid = worker["pid"]
                 port = worker["port"]
-                logger.info(f"[WATCHDOG] Processing {worker_id}: port={port}, state={worker['state']}, life_pages={worker.get('current_life_pages', 0)}, lifetime={worker.get('lifetime_pages', 0)}, restarts={worker.get('restart_count', 0)}")
+                logger.info(f"[WATCHDOG] Processing {worker_id}: port={port}, state={worker['state']}, life_pages={worker.get('current_life_pages', 0)}, lifetime={worker.get('lifetime_pages', 0)}, restarts={worker.get('restart_count', 0)}, restart_pending={worker.get('restart_pending', False)}")
 
                 # Check if process is alive
                 process_exists = pid and psutil.pid_exists(pid)
@@ -2154,64 +2356,31 @@ async def watchdog():
                 except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
                     logger.info(f"[WATCHDOG] {worker_id}: psutil exception: {e}")
 
-                # Check page count limit (based on current life pages, not lifetime)
-                current_life_pages = worker.get("current_life_pages", 0)
-                if current_life_pages >= MAX_PAGES_BEFORE_RESTART:
-                    logger.info(f"[WATCHDOG] {worker_id}: current_life_pages={current_life_pages} >= {MAX_PAGES_BEFORE_RESTART}, triggering restart...")
-                    if worker["state"] != "processing":
-                        logger.info(f"[WATCHDOG] {worker_id}: state={worker['state']} != processing, polling pending sub-jobs...")
-                        # Poll pending jobs to detect completion and save results
-                        pending_sub_jobs = job_manager.get_pending_sub_jobs_for_worker(port)
-                        logger.info(f"[WATCHDOG] {worker_id}: got {len(pending_sub_jobs)} pending sub-jobs for port {port}")
-                        for job_id, sub_job in pending_sub_jobs:
-                            if not sub_job.worker_task_id:
-                                logger.info(f"[WATCHDOG] {worker_id}: sub_job {sub_job.sub_job_id[:8]} has no worker_task_id, skipping")
-                                continue
-                            try:
-                                logger.info(f"[WATCHDOG] {worker_id}: polling task {sub_job.worker_task_id[:8]} on port {port}...")
-                                status, _ = await poll_worker_status(port, sub_job.worker_task_id)
-                                logger.info(f"[WATCHDOG] {worker_id}: task {sub_job.worker_task_id[:8]} status={status}")
-                                if status == "success":
-                                    result, error = await get_worker_result(port, sub_job.worker_task_id)
-                                    if result:
-                                        job_manager.complete_sub_job(sub_job.sub_job_id, result=result)
-                                        logger.info(f"[WATCHDOG] {worker_id}: completed sub_job {sub_job.sub_job_id[:8]}")
-                                    else:
-                                        job_manager.complete_sub_job(sub_job.sub_job_id, error=error or "Failed to fetch")
-                                        logger.info(f"[WATCHDOG] {worker_id}: failed sub_job {sub_job.sub_job_id[:8]}: {error}")
-                                elif status == "failure":
-                                    job_manager.complete_sub_job(sub_job.sub_job_id, error="Worker task failed")
-                                    logger.info(f"[WATCHDOG] {worker_id}: task failed for sub_job {sub_job.sub_job_id[:8]}")
-                            except Exception as e:
-                                logger.warning(f"Watchdog poll error for {job_id}: {e}")
-
-                        # Save completed parent jobs to disk
-                        logger.info(f"[WATCHDOG] {worker_id}: checking {len(pending_sub_jobs)} parent jobs for disk save...")
-                        for job_id, _ in pending_sub_jobs:
-                            job = job_manager.get_job(job_id)
-                            if job:
-                                logger.info(f"[WATCHDOG] {worker_id}: job {job_id[:8]} status={job.status.value}, exists_on_disk={result_storage.result_exists(job_id)}")
-                            if job and job.status == JobStatus.COMPLETED and not result_storage.result_exists(job_id):
-                                merged = _build_merged_result(job)
-                                result_storage.save_result(job_id, merged)
-                                logger.info(f"Watchdog saved job {job_id} to disk")
-
-                        # Re-check pending after polling
-                        pending = job_manager.get_pending_jobs_for_worker(port)
-                        logger.info(f"[WATCHDOG] {worker_id}: re-check pending for port {port} = {len(pending)} jobs")
-                        if not pending:
-                            logger.info(f"[WATCHDOG] {worker_id}: current_life_pages={current_life_pages} >= {MAX_PAGES_BEFORE_RESTART}, restarting...")
-                            await restart_worker(worker_id, reason=f"page_limit ({current_life_pages} pages)")
-                            continue
+                # Check restart_pending tag (set during job assignment when page limit reached)
+                # TAG-based restart: worker was tagged for restart, now waiting for it to be idle
+                if worker.get("restart_pending"):
+                    current_life_pages = worker.get("current_life_pages", 0)
+                    if worker["state"] == "ready":
+                        logger.info(f"[WATCHDOG] {worker_id}: restart_pending=True, state=ready, triggering restart (pages={current_life_pages})...")
+                        await restart_worker(worker_id, reason=f"page_limit ({current_life_pages} pages)")
+                        continue
                     else:
-                        logger.info(f"[WATCHDOG] {worker_id}: state={worker['state']} == processing, skipping restart check")
+                        logger.info(f"[WATCHDOG] {worker_id}: restart_pending=True but state={worker['state']}, waiting for ready...")
 
-                # Check idle timeout
+                # Check idle timeout (also respects MAX_UNAVAILABLE)
                 idle_time = time.time() - worker["last_activity"]
-                if idle_time > IDLE_RESTART_SEC and worker["state"] == "ready":
-                    logger.info(f"[WATCHDOG] {worker_id}: idle for {idle_time:.0f}s > {IDLE_RESTART_SEC}s, restarting...")
-                    await restart_worker(worker_id, reason="idle_timeout")
-                    continue
+                if idle_time > IDLE_RESTART_SEC and worker["state"] == "ready" and not worker.get("restart_pending"):
+                    # Count unavailable workers (restarting or pending restart)
+                    unavailable_count = sum(
+                        1 for w in workers.values()
+                        if w.get("restart_pending") or w.get("state") == "restarting"
+                    )
+                    if unavailable_count < MAX_UNAVAILABLE:
+                        logger.info(f"[WATCHDOG] {worker_id}: idle for {idle_time:.0f}s > {IDLE_RESTART_SEC}s, restarting... (unavailable={unavailable_count}/{MAX_UNAVAILABLE})")
+                        await restart_worker(worker_id, reason="idle_timeout")
+                        continue
+                    else:
+                        logger.info(f"[WATCHDOG] {worker_id}: deferring idle restart, {unavailable_count} workers already unavailable")
 
             await asyncio.sleep(5)
 

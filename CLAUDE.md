@@ -489,6 +489,50 @@ Check logs for expected output format. If logs look different from what code sho
 
 ---
 
+## CRITICAL: Starting Workers and Controller (Local Development)
+
+**The controller does NOT auto-spawn docling-serve workers.** You must start them manually.
+
+### Full Startup Procedure
+
+```bash
+# 1. Kill any existing processes
+pkill -9 -f "python.*controller"
+pkill -9 -f "docling-serve"
+sleep 2
+
+# 2. Start docling-serve workers (at least 2 for parallel processing)
+nohup docling-serve run --host 0.0.0.0 --port 5001 > /tmp/worker1.log 2>&1 &
+nohup docling-serve run --host 0.0.0.0 --port 5002 > /tmp/worker2.log 2>&1 &
+
+# 3. Wait for workers to initialize (~8 seconds)
+sleep 8
+
+# 4. Verify workers are running
+curl -s http://localhost:5001/health && curl -s http://localhost:5002/health
+# Should output: {"status":"ok"}{"status":"ok"}
+
+# 5. Start the controller (it will find the running workers)
+cd /Users/bhoshaga/stru-docling
+nohup python3 controller.py > /tmp/ctrl_out.log 2>&1 &
+
+# 6. Wait and verify
+sleep 5
+curl -s http://localhost:8000/health
+# Should output: {"status":"ok"}
+
+# 7. Verify controller found workers
+grep "Found.*workers" server.log | tail -1
+# Should show: Found 2 workers: ['docling_1', 'docling_2']
+```
+
+### Common Mistakes
+- **Starting controller without workers** → "Found 0 workers" → jobs hang waiting for workers
+- **Workers died but controller still running** → Jobs hang, need to restart workers then controller
+- **Multiple controller processes** → Old code handles requests, check with `pgrep -a controller`
+
+---
+
 ## Worker Restart Configuration
 
 Workers automatically restart based on these limits (set via environment variables):
@@ -515,3 +559,5 @@ Workers automatically restart based on these limits (set via environment variabl
 9. **Not checking logs on error** → `tail ./server.log` shows actual errors
 10. **Using pdf_backend V2** → V2 has catastrophic memory leaks. Always use V4 (dlparse_v4)
 11. **Truncating IDs in logs** → Always log full UUIDs, never truncate with `[:8]`
+12. **Not restarting controller after code changes** → Controller.py changes require restart. ALWAYS kill and restart the controller after editing controller.py. Verify new code is running by checking logs for new log messages/formats.
+13. **Using too-short timeouts in tests** → PDF conversion takes 20-40s. Use at least 120s timeout for HTTP requests in test scripts.
