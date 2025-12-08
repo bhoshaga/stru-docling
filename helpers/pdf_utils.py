@@ -1,10 +1,14 @@
 """
 PDF utilities for page splitting and counting.
 """
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from typing import List, Tuple
 
 from pypdf import PdfReader, PdfWriter
+
+# Thread pool for parallel PDF operations
+_pdf_pool = ThreadPoolExecutor(max_workers=8)
 
 
 def get_page_count(pdf_bytes: bytes) -> int:
@@ -117,9 +121,14 @@ def split_pdf_for_workers(
     total_pages = get_page_count(pdf_bytes)
     page_ranges = split_page_ranges(total_pages, num_workers, user_range)
 
-    chunks = []
-    for start, end in page_ranges:
+    # Extract all chunks in parallel using thread pool
+    def extract_chunk(page_range):
+        start, end = page_range
         chunk_bytes = extract_pages(pdf_bytes, start, end)
-        chunks.append((chunk_bytes, (start, end)))
+        return (chunk_bytes, (start, end))
+
+    # Submit all extractions to thread pool
+    futures = [_pdf_pool.submit(extract_chunk, pr) for pr in page_ranges]
+    chunks = [f.result() for f in futures]
 
     return chunks

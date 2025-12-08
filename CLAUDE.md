@@ -561,3 +561,41 @@ Workers automatically restart based on these limits (set via environment variabl
 11. **Truncating IDs in logs** → Always log full UUIDs, never truncate with `[:8]`
 12. **Not restarting controller after code changes** → Controller.py changes require restart. ALWAYS kill and restart the controller after editing controller.py. Verify new code is running by checking logs for new log messages/formats.
 13. **Using too-short timeouts in tests** → PDF conversion takes 20-40s. Use at least 120s timeout for HTTP requests in test scripts.
+14. **Starting controller without checking port 8000** → ALWAYS run `lsof -i :8000` before starting controller. If port is in use, kill the old process first. Old controllers running old code will silently handle requests.
+15. **Not clearing Python cache** → ALWAYS run `rm -rf __pycache__ helpers/__pycache__` before restarting controller after code changes. Python may use stale .pyc bytecode files.
+16. **Not verifying new code is running** → After restart, check `server.log` for expected new log messages. If logs look different from what code should produce, old process is still running or cache wasn't cleared.
+17. **Not tracing actual code path** → When adding functionality, trace the ACTUAL code path from endpoint to execution. Don't assume a function is being called - VERIFY IT. If debug logs don't appear, the code path is wrong. Check for inline/duplicate implementations that bypass your changes.
+
+### Proper Controller Restart Procedure
+
+**IMPORTANT:** Don't use `pkill -f "python.*controller"` - it doesn't match properly on macOS.
+Instead, kill by PORT which is reliable:
+
+```bash
+# 1. Kill process on port 8000 (reliable method)
+lsof -ti :8000 | xargs kill -9 2>/dev/null
+sleep 2
+
+# 2. Verify port is free
+lsof -i :8000  # Must show NOTHING
+
+# 3. Clear Python cache
+rm -rf __pycache__ helpers/__pycache__
+
+# 4. Clear logs for clean slate (optional)
+rm -f server.log
+
+# 5. Start fresh controller
+cd /Users/bhoshaga/stru-docling
+nohup python3 controller.py > /tmp/ctrl_out.log 2>&1 &
+
+# 6. Wait and verify
+sleep 4
+curl -s http://localhost:8000/health
+```
+
+**For workers too:**
+```bash
+lsof -ti :5001 | xargs kill -9 2>/dev/null
+lsof -ti :5002 | xargs kill -9 2>/dev/null
+```

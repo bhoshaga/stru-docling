@@ -78,6 +78,9 @@ from helpers import (
     merge_document_results,
     chunk_router,
     init_chunk_router,
+    worker_router,
+    init_worker_router,
+    submit_chunk_with_retry,
 )
 
 # =============================================================================
@@ -215,6 +218,18 @@ async def lifespan(app: FastAPI):
         chunk_tasks_dict=chunk_tasks,
     )
 
+    # Initialize worker router with dependencies
+    init_worker_router(
+        verify_api_key_func=verify_api_key,
+        workers_dict=workers,
+        min_port=MIN_PORT,
+        max_port=MAX_PORT,
+        get_worker_id_func=get_worker_id,
+        init_worker_func=init_worker,
+        restart_worker_func=restart_worker,
+        remove_worker_func=remove_worker,
+    )
+
     # Start background tasks
     background_tasks.append(asyncio.create_task(watchdog()))
     background_tasks.append(asyncio.create_task(cleanup_task()))
@@ -263,6 +278,7 @@ app = FastAPI(title="Docling Controller", version="2.0.0", lifespan=lifespan)
 app.include_router(upload_router)
 app.include_router(stats_router)
 app.include_router(chunk_router)
+app.include_router(worker_router)
 
 # Round-robin index for load balancing proxy requests
 _rr_index = 0
@@ -481,6 +497,28 @@ def start_worker_process(port: int) -> int:
         start_new_session=True
     )
     return proc.pid
+
+
+def get_real_pid_on_port(port: int) -> int | None:
+    """Get the actual PID of the process listening on a port using lsof.
+
+    This is the source of truth - more reliable than stored PIDs which can
+    become stale (zombie processes, restarts, etc).
+    """
+    try:
+        result = subprocess.run(
+            f"lsof -ti :{port}",
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.stdout.strip():
+            return int(result.stdout.strip().split()[0])  # First PID if multiple
+        return None
+    except Exception as e:
+        logger.warning(f"[PID_CHECK] Failed to get PID on port {port}: {e}")
+        return None
 
 
 def kill_worker_process(pid: int) -> bool:
@@ -853,9 +891,11 @@ async def submit_chunk_with_page_split(
             return None, f"Worker {port} unreachable: {e}"
 
     # Multiple pages: split, submit all, poll all, merge
+    chunk_start_time = time.time()
     logger.info(f"[PAGE_SPLIT] Splitting {num_pages} pages for worker {port} (pages {start_page}-{end_page})")
 
     # Extract each page in parallel using ThreadPoolExecutor (CPU-bound)
+    extract_start = time.time()
     loop = asyncio.get_event_loop()
     extract_tasks = [
         loop.run_in_executor(_pdf_executor, extract_pages, chunk_bytes, i + 1, i + 1)
@@ -866,10 +906,12 @@ async def submit_chunk_with_page_split(
     except Exception as e:
         logger.error(f"[PAGE_SPLIT] Failed to extract pages: {e}")
         return None, f"Page extraction failed: {e}"
+    extract_elapsed = time.time() - extract_start
 
-    logger.info(f"[PAGE_SPLIT] Extracted {len(page_bytes_list)} pages, submitting to worker {port}...")
+    logger.info(f"[TIMING] Worker {port}: page_extract={extract_elapsed:.3f}s for {len(page_bytes_list)} pages")
 
     # Submit all pages in parallel (I/O-bound)
+    submit_start = time.time()
     async def submit_single_page(page_bytes: bytes, page_num: int):
         task_id, error = await submit_to_worker(port, page_bytes, filename, to_formats)
         return (task_id, page_num, error)
@@ -879,6 +921,7 @@ async def submit_chunk_with_page_split(
         for i, pb in enumerate(page_bytes_list)
     ]
     submissions = await asyncio.gather(*submit_tasks)
+    submit_elapsed = time.time() - submit_start
 
     # Check for submission failures
     successful_submissions = [(tid, pn) for tid, pn, err in submissions if tid and not err]
@@ -890,9 +933,10 @@ async def submit_chunk_with_page_split(
     if not successful_submissions:
         return None, "All page submissions failed"
 
-    logger.info(f"[PAGE_SPLIT] Submitted {len(successful_submissions)} pages, polling...")
+    logger.info(f"[TIMING] Worker {port}: http_submit={submit_elapsed:.3f}s for {len(successful_submissions)} pages")
 
-    # Poll all tasks until complete
+    # Poll all tasks until complete (this is where library processing happens)
+    poll_start = time.time()
     pending = {tid: pn for tid, pn in successful_submissions}
     completed = {}  # task_id -> (page_num, result)
     max_wait = 300  # 5 minutes
@@ -916,6 +960,7 @@ async def submit_chunk_with_page_split(
     except Exception as e:
         logger.warning(f"[PAGE_SPLIT] Worker {port} unreachable: {e}")
         return None, f"Worker {port} unreachable: {e}"
+    poll_elapsed = time.time() - poll_start
 
     if pending:
         logger.warning(f"[PAGE_SPLIT] Timeout waiting for {len(pending)} pages")
@@ -923,9 +968,10 @@ async def submit_chunk_with_page_split(
     if not completed:
         return None, "No pages completed successfully"
 
-    logger.info(f"[PAGE_SPLIT] {len(completed)} pages completed, merging...")
+    logger.info(f"[TIMING] Worker {port}: library_process={poll_elapsed:.3f}s for {len(completed)} pages")
 
     # Merge results (sorted by page number)
+    merge_start = time.time()
     sorted_results = sorted(completed.values(), key=lambda x: x[0])
 
     # Build merged result in same format as merge_document_results expects
@@ -935,8 +981,11 @@ async def submit_chunk_with_page_split(
     ]
 
     merged = merge_document_results(sub_results, filename)
+    merge_elapsed = time.time() - merge_start
 
-    logger.info(f"[PAGE_SPLIT] Merged {len(sorted_results)} pages into single result")
+    # Total chunk timing
+    chunk_elapsed = time.time() - chunk_start_time
+    logger.info(f"[TIMING] Worker {port}: merge={merge_elapsed:.3f}s, chunk_total={chunk_elapsed:.3f}s")
 
     # Set worker state back to ready
     worker_id = get_worker_id(port)
@@ -951,53 +1000,6 @@ async def submit_chunk_with_page_split(
 
     # merged already has {document, status, errors, processing_time, timings} format
     return merged, None
-
-
-async def submit_chunk_with_retry(
-    port: int,
-    chunk_bytes: bytes,
-    original_pages: Tuple[int, int],
-    filename: str,
-    to_formats: str,
-    api_key: str,
-    job_id: str,
-) -> Tuple[Optional[dict], Optional[str]]:
-    """
-    Submit chunk with automatic retry on failure.
-
-    If initial submission fails, tries another available worker once.
-    Returns (result, error) - error is None on success.
-    """
-    result, error = await submit_chunk_with_page_split(
-        port, chunk_bytes, original_pages, filename, to_formats
-    )
-
-    if error:
-        logger.warning(f"[JOB {job_id}] Worker {port} failed for pages {original_pages[0]}-{original_pages[1]}: {error}")
-
-        # Find another available worker (ready, not restart_pending, not the failed one)
-        allowed_ports = get_workers_for_api_key(api_key)
-        retry_port = None
-        for p in allowed_ports:
-            if p == port:
-                continue  # Skip failed worker
-            worker_id = get_worker_id(p)
-            if worker_id in workers:
-                w = workers[worker_id]
-                if w.get("state") == "ready" and not w.get("restart_pending"):
-                    retry_port = p
-                    break
-
-        if retry_port:
-            logger.info(f"[JOB {job_id}] RETRY: pages {original_pages[0]}-{original_pages[1]} on worker {retry_port}")
-            result, error = await submit_chunk_with_page_split(
-                retry_port, chunk_bytes, original_pages, filename, to_formats
-            )
-
-        if error:
-            logger.error(f"[JOB {job_id}] FAILED pages {original_pages[0]}-{original_pages[1]} after retry: {error}")
-
-    return result, error
 
 
 # =============================================================================
@@ -1109,8 +1111,11 @@ async def convert_file_async(
 
     # Split PDF across workers
     try:
+        split_start = time.time()
         chunks = split_pdf_for_workers(file_bytes, len(available_workers), user_range)
+        split_elapsed = time.time() - split_start
         # Log detailed split info
+        logger.info(f"[TIMING] JOB {job.job_id}: worker_split={split_elapsed:.3f}s for {len(chunks)} chunks")
         logger.info(f"[JOB {job.job_id}] SPLIT: {len(chunks)} chunks across {len(chunks)} workers")
         for i, (chunk_bytes, page_range) in enumerate(chunks):
             worker_port = available_workers[i]
@@ -1136,7 +1141,17 @@ async def convert_file_async(
 
         # Submit with retry on failure
         result, error = await submit_chunk_with_retry(
-            port, chunk_bytes, original_pages, filename, to_formats, api_key, job.job_id
+            port=port,
+            chunk_bytes=chunk_bytes,
+            original_pages=original_pages,
+            filename=filename,
+            to_formats=to_formats,
+            api_key=api_key,
+            job_id=job.job_id,
+            submit_func=submit_chunk_with_page_split,
+            get_workers_for_api_key_func=get_workers_for_api_key,
+            get_worker_id_func=get_worker_id,
+            workers_dict=workers,
         )
 
         if error:
@@ -1475,7 +1490,17 @@ async def convert_source_async(
         )
         # Submit with retry on failure
         result, error = await submit_chunk_with_retry(
-            port, chunk_bytes, original_pages, filename, to_formats, api_key, job.job_id
+            port=port,
+            chunk_bytes=chunk_bytes,
+            original_pages=original_pages,
+            filename=filename,
+            to_formats=to_formats,
+            api_key=api_key,
+            job_id=job.job_id,
+            submit_func=submit_chunk_with_page_split,
+            get_workers_for_api_key_func=get_workers_for_api_key,
+            get_worker_id_func=get_worker_id,
+            workers_dict=workers,
         )
         if error:
             job_manager.complete_sub_job(sub_job.sub_job_id, error=error)
@@ -1963,46 +1988,6 @@ async def get_version():
     }
 
 
-@app.post("/worker/add")
-async def add_worker(port: Optional[int] = None, _: str = Depends(verify_api_key)):
-    """Add a new worker."""
-    if port is None:
-        used_ports = {w["port"] for w in workers.values()}
-        for p in range(MIN_PORT, MAX_PORT + 1):
-            if p not in used_ports:
-                port = p
-                break
-        if port is None:
-            raise HTTPException(status_code=503, detail="No available ports")
-
-    worker_id = get_worker_id(port)
-    if worker_id in workers:
-        raise HTTPException(status_code=409, detail=f"Worker {worker_id} already exists")
-
-    await init_worker(port)
-    return {"worker_id": worker_id, "port": port, "added": True}
-
-
-@app.post("/worker/{worker_id}/restart")
-async def restart_worker_endpoint(worker_id: str, _: str = Depends(verify_api_key)):
-    """Restart a specific worker."""
-    if worker_id not in workers:
-        raise HTTPException(status_code=404, detail=f"Worker {worker_id} not found")
-
-    success = await restart_worker(worker_id, reason="manual")
-    return {"worker_id": worker_id, "restarted": success}
-
-
-@app.post("/worker/{worker_id}/remove")
-async def remove_worker_endpoint(worker_id: str, _: str = Depends(verify_api_key)):
-    """Remove a worker."""
-    if worker_id not in workers:
-        raise HTTPException(status_code=404, detail=f"Worker {worker_id} not found")
-
-    success = await remove_worker(worker_id)
-    return {"worker_id": worker_id, "removed": success}
-
-
 # =============================================================================
 # DOCS PASSTHROUGH
 # =============================================================================
@@ -2127,18 +2112,29 @@ async def watchdog():
         try:
             logger.info(f"[WATCHDOG] === Starting watchdog iteration, {len(workers)} workers ===")
             for worker_id, worker in list(workers.items()):
-                pid = worker["pid"]
+                stored_pid = worker["pid"]
                 port = worker["port"]
                 logger.info(f"[WATCHDOG] Processing {worker_id}: port={port}, state={worker['state']}, life_pages={worker.get('current_life_pages', 0)}, lifetime={worker.get('lifetime_pages', 0)}, restarts={worker.get('restart_count', 0)}, restart_pending={worker.get('restart_pending', False)}")
 
-                # Check if process is alive
-                process_exists = pid and psutil.pid_exists(pid)
-                logger.info(f"[WATCHDOG] {worker_id}: pid={pid}, exists={process_exists}")
-                if not process_exists:
-                    logger.info(f"[WATCHDOG] {worker_id}: PROCESS DEAD! Triggering restart...")
-                    print(f"Watchdog: {worker_id} process dead, restarting...")
+                # Get the REAL PID from lsof - this is the source of truth
+                real_pid = get_real_pid_on_port(port)
+                logger.info(f"[WATCHDOG] {worker_id}: stored_pid={stored_pid}, real_pid={real_pid}")
+
+                # If no process on port, worker is dead
+                if real_pid is None:
+                    logger.info(f"[WATCHDOG] {worker_id}: NO PROCESS ON PORT {port}! Triggering restart...")
+                    print(f"Watchdog: {worker_id} no process on port {port}, restarting...")
                     await restart_worker(worker_id, reason="process_died")
                     continue
+
+                # If PID changed (e.g., external restart), update our tracking
+                if real_pid != stored_pid:
+                    logger.warning(f"[WATCHDOG] {worker_id}: PID MISMATCH! stored={stored_pid}, real={real_pid}. Updating...")
+                    worker["pid"] = real_pid
+                    stored_pid = real_pid
+
+                # Use real_pid for all subsequent checks
+                pid = real_pid
 
                 # Check memory limit
                 try:

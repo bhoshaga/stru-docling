@@ -40,6 +40,13 @@ from .chunk_router import (
     router as chunk_router,
     init_router as init_chunk_router,
 )
+from .worker_router import (
+    router as worker_router,
+    init_router as init_worker_router,
+)
+from .retry_handler import (
+    submit_chunk_with_retry,
+)
 
 __all__ = [
     # PDF utils
@@ -73,4 +80,9 @@ __all__ = [
     # Chunk router
     "chunk_router",
     "init_chunk_router",
+    # Worker router
+    "worker_router",
+    "init_worker_router",
+    # Retry handler
+    "submit_chunk_with_retry",
 ]
