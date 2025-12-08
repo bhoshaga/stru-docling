@@ -78,9 +78,15 @@ from helpers import (
     merge_document_results,
     chunk_router,
     init_chunk_router,
+    # Job queue
+    JobRequest,
+    init_job_queue,
+    enqueue_job,
+    job_queue_consumer,
     worker_router,
     init_worker_router,
     submit_chunk_with_retry,
+    validate_file_type,
 )
 
 # =============================================================================
@@ -230,7 +236,25 @@ async def lifespan(app: FastAPI):
         remove_worker_func=remove_worker,
     )
 
+    # Initialize job queue with dependencies
+    init_job_queue(
+        get_available_workers_func=get_available_workers,
+        split_pdf_for_workers_func=split_pdf_for_workers,
+        submit_chunk_with_retry_func=submit_chunk_with_retry,
+        submit_chunk_with_page_split_func=submit_chunk_with_page_split,
+        submit_to_worker_func=submit_to_worker,
+        poll_worker_status_func=poll_worker_status,
+        get_worker_result_func=get_worker_result,
+        get_workers_for_api_key_func=get_workers_for_api_key,
+        get_worker_id_func=get_worker_id,
+        workers_dict=workers,
+        job_manager_instance=job_manager,
+        load_balancer_instance=load_balancer,
+        max_pages_before_restart=MAX_PAGES_BEFORE_RESTART,
+    )
+
     # Start background tasks
+    background_tasks.append(asyncio.create_task(job_queue_consumer()))  # Job queue consumer
     background_tasks.append(asyncio.create_task(watchdog()))
     background_tasks.append(asyncio.create_task(cleanup_task()))
 
@@ -323,10 +347,17 @@ def get_limits_for_api_key(api_key: str) -> Tuple[int, int]:
     return 20, 20  # Default to shared tier limits
 
 
-def check_file_limits(file_bytes: bytes, api_key: str, is_pdf: bool = True) -> Optional[str]:
+def check_file_limits(file_bytes: bytes, api_key: str, filename: str = "", is_pdf: bool = True) -> Optional[str]:
     """
-    Check if file meets tier limits. Returns error message if exceeded, None if OK.
+    Check if file meets tier limits and is a supported type.
+    Returns error message if invalid, None if OK.
     """
+    # Check file type is supported
+    if filename:
+        type_error = validate_file_type(filename)
+        if type_error:
+            return type_error
+
     max_file_mb, max_pages = get_limits_for_api_key(api_key)
 
     # Check file size
@@ -395,6 +426,7 @@ async def get_available_workers(api_key: str, max_wait: int = 60) -> List[int]:
             pages = worker.get("current_life_pages", 0)
             restart_pending = worker.get("restart_pending", False)
 
+            # Workers with restart_pending are unavailable (tagged by tag_workers_for_restart)
             if restart_pending:
                 unavailable_reasons.append(f"{worker_id}: restart_pending (pages={pages})")
             elif state == "ready":
@@ -607,15 +639,15 @@ async def restart_worker(worker_id: str, reason: str = "manual"):
     pending_sub_jobs = job_manager.get_pending_sub_jobs_for_worker(port)
     logger.info(f"[RESTART] {worker_id}: got {len(pending_sub_jobs)} pending sub-jobs to poll before restart")
     for job_id, sub_job in pending_sub_jobs:
-        logger.info(f"[RESTART] {worker_id}: checking sub_job {sub_job.sub_job_id[:8]}, task_id={sub_job.worker_task_id}")
+        logger.info(f"[RESTART] {worker_id}: checking sub_job {sub_job.sub_job_id}, task_id={sub_job.worker_task_id}")
         if not sub_job.worker_task_id:
             logger.info(f"[RESTART] {worker_id}: sub_job has no task_id, skipping")
             continue
         try:
             # Poll worker for status
-            logger.info(f"[RESTART] {worker_id}: polling task {sub_job.worker_task_id[:8]} on port {port}...")
+            logger.info(f"[RESTART] {worker_id}: polling task {sub_job.worker_task_id} on port {port}...")
             status, _ = await poll_worker_status(port, sub_job.worker_task_id)
-            logger.info(f"[RESTART] {worker_id}: task {sub_job.worker_task_id[:8]} status={status}")
+            logger.info(f"[RESTART] {worker_id}: task {sub_job.worker_task_id} status={status}")
             if status == "success":
                 # Fetch result and complete sub-job
                 result, error = await get_worker_result(port, sub_job.worker_task_id)
@@ -626,12 +658,12 @@ async def restart_worker(worker_id: str, reason: str = "manual"):
                     job_manager.complete_sub_job(sub_job.sub_job_id, error=error or "Failed to fetch result")
             elif status == "failure":
                 job_manager.complete_sub_job(sub_job.sub_job_id, error="Worker task failed")
-                logger.info(f"[RESTART] {worker_id}: task failed for sub_job {sub_job.sub_job_id[:8]}")
+                logger.info(f"[RESTART] {worker_id}: task failed for sub_job {sub_job.sub_job_id}")
             # If still processing, we'll lose this result - log warning
             elif status == "started":
                 logger.warning(f"Sub-job {sub_job.sub_job_id} still processing, may lose result on restart")
             else:
-                logger.warning(f"[RESTART] {worker_id}: unexpected status '{status}' for task {sub_job.worker_task_id[:8]}")
+                logger.warning(f"[RESTART] {worker_id}: unexpected status '{status}' for task {sub_job.worker_task_id}")
         except Exception as e:
             logger.warning(f"Could not save pending result for {job_id}: {e}")
 
@@ -768,20 +800,36 @@ async def submit_to_worker(
                     workers[worker_id]["last_activity"] = time.time()
                 return task_id, None
             else:
-                error = f"Worker returned {response.status_code}: {response.text[:200]}"
+                error = f"Worker returned {response.status_code}: {response.text}"
                 logger.error(f"Worker {port} error: {error}")
+                # Set state to failed so watchdog can restart
+                if worker_id in workers:
+                    workers[worker_id]["state"] = "failed"
+                    load_balancer.update_worker(port, workers[worker_id])
                 return None, error
 
     except httpx.TimeoutException:
         error = f"Timeout submitting to worker on port {port}"
         logger.error(error)
+        # Set state to failed so watchdog can restart
+        if worker_id in workers:
+            workers[worker_id]["state"] = "failed"
+            load_balancer.update_worker(port, workers[worker_id])
         return None, error
     except httpx.ConnectError:
         error = f"Cannot connect to worker on port {port}"
         logger.error(error)
+        # Set state to failed so watchdog can restart
+        if worker_id in workers:
+            workers[worker_id]["state"] = "failed"
+            load_balancer.update_worker(port, workers[worker_id])
         return None, error
     except Exception as e:
         logger.error(f"Worker {port} exception: {e}")
+        # Set state to failed so watchdog can restart
+        if worker_id in workers:
+            workers[worker_id]["state"] = "failed"
+            load_balancer.update_worker(port, workers[worker_id])
         return None, str(e)
 
 
@@ -923,12 +971,15 @@ async def submit_chunk_with_page_split(
     submissions = await asyncio.gather(*submit_tasks)
     submit_elapsed = time.time() - submit_start
 
-    # Check for submission failures
+    # Check for submission failures - track failed pages
     successful_submissions = [(tid, pn) for tid, pn, err in submissions if tid and not err]
     failed_submissions = [(pn, err) for tid, pn, err in submissions if err]
+    failed_pages = []  # Track all failed pages with reasons
 
     if failed_submissions:
         logger.warning(f"[PAGE_SPLIT] {len(failed_submissions)} pages failed to submit: {failed_submissions}")
+        for pn, err in failed_submissions:
+            failed_pages.append({"page": pn, "reason": f"submission_failed: {err}"})
 
     if not successful_submissions:
         return None, "All page submissions failed"
@@ -952,7 +1003,9 @@ async def submit_chunk_with_page_split(
                         completed[task_id] = (pending[task_id], result)
                     del pending[task_id]
                 elif status == "failure":
-                    logger.warning(f"[PAGE_SPLIT] Page {pending[task_id]} failed")
+                    page_num = pending[task_id]
+                    logger.warning(f"[PAGE_SPLIT] Page {page_num} failed")
+                    failed_pages.append({"page": page_num, "reason": "processing_failed"})
                     del pending[task_id]
 
             if pending:
@@ -963,7 +1016,9 @@ async def submit_chunk_with_page_split(
     poll_elapsed = time.time() - poll_start
 
     if pending:
-        logger.warning(f"[PAGE_SPLIT] Timeout waiting for {len(pending)} pages")
+        logger.warning(f"[PAGE_SPLIT] Timeout waiting for {len(pending)} pages: {list(pending.values())}")
+        for task_id, page_num in pending.items():
+            failed_pages.append({"page": page_num, "reason": "timeout"})
 
     if not completed:
         return None, "No pages completed successfully"
@@ -982,6 +1037,12 @@ async def submit_chunk_with_page_split(
 
     merged = merge_document_results(sub_results, filename)
     merge_elapsed = time.time() - merge_start
+
+    # Add failed_pages info and set status to "partial" if some pages failed
+    if failed_pages:
+        merged["failed_pages"] = sorted(failed_pages, key=lambda x: x["page"])
+        merged["status"] = "partial"
+        logger.warning(f"[PAGE_SPLIT] Returning partial result: {len(completed)} succeeded, {len(failed_pages)} failed")
 
     # Total chunk timing
     chunk_elapsed = time.time() - chunk_start_time
@@ -1017,71 +1078,26 @@ async def convert_file_async(
     """
     Convert a PDF file with automatic page splitting across workers.
 
-    The PDF is split across available workers for parallel processing.
+    Returns task_id IMMEDIATELY - processing happens in background queue.
     Workers are selected based on API key tier:
     - "windowseat" (dedicated): 8 workers (ports 5001-5008)
     - "middleseat" (shared): 2 workers (ports 5009-5010)
 
     Returns a job_id that can be used to poll for status and get results.
     """
+    request_start = time.time()
+
     # Read file bytes
     file_bytes = await files.read()
     filename = files.filename or "document.pdf"
     is_pdf = filename.lower().endswith(".pdf")
-    logger.info(f"Received file: {filename}, size={len(file_bytes)} bytes, is_pdf={is_pdf}, api_key={api_key}")
+    file_size = len(file_bytes)
+    logger.info(f"[ASYNC] Received file: {filename}, size={file_size} bytes, is_pdf={is_pdf}, api_key={api_key}")
 
     # Check tier limits
-    limit_error = check_file_limits(file_bytes, api_key, is_pdf=is_pdf)
+    limit_error = check_file_limits(file_bytes, api_key, filename=filename, is_pdf=is_pdf)
     if limit_error:
         raise HTTPException(status_code=413, detail=limit_error)
-
-    # Get available workers for this API key (calls tag_workers_for_restart)
-    available_workers = await get_available_workers(api_key, max_wait=60)
-
-    if not available_workers:
-        raise HTTPException(status_code=503, detail="No workers available after 60s wait")
-
-    # For non-PDF files, route to single coolest worker
-    if not is_pdf:
-        # Pick the least busy worker
-        # Use load balancer to pick best worker for this api_key
-        coolest_port = load_balancer.select_single_worker(api_key)
-        if not coolest_port:
-            coolest_port = available_workers[0]
-
-        logger.info(f"Non-PDF file, routing to single worker: {coolest_port}")
-
-        # Create job with single sub-job
-        job = job_manager.create_job(filename=filename, total_pages=1, user_page_range=None)
-        job_manager.start_job(job.job_id)
-
-        sub_job = job_manager.add_sub_job(
-            job_id=job.job_id,
-            worker_port=coolest_port,
-            original_pages=(1, 1),
-        )
-
-        task_id, error = await submit_to_worker(coolest_port, file_bytes, filename, to_formats)
-        if error:
-            job_manager.complete_sub_job(sub_job.sub_job_id, error=error)
-            raise HTTPException(status_code=500, detail=f"Worker error: {error}")
-
-        job_manager.register_worker_task(sub_job.sub_job_id, task_id)
-
-        return {
-            "task_id": job.job_id,
-            "status": "pending",
-            "total_pages": 1,
-            "workers_used": 1,
-        }
-
-    # PDF: Get page count and split across workers
-    try:
-        total_pages = get_page_count(file_bytes)
-        logger.info(f"PDF has {total_pages} pages")
-    except Exception as e:
-        logger.error(f"Invalid PDF: {e}")
-        raise HTTPException(status_code=400, detail=f"Invalid PDF: {e}")
 
     # Parse user page range if provided
     user_range = None
@@ -1091,104 +1107,53 @@ async def convert_file_async(
         except (ValueError, IndexError):
             pass
 
-    # Determine pages to process
-    if user_range:
-        start_page, end_page = user_range
-        start_page = max(1, min(start_page, total_pages))
-        end_page = max(start_page, min(end_page, total_pages))
-        pages_to_process = end_page - start_page + 1
-    else:
-        start_page, end_page = 1, total_pages
-        pages_to_process = total_pages
+    # For PDFs, get page count to validate and determine pages_to_process
+    total_pages = 1
+    pages_to_process = 1
+    if is_pdf:
+        try:
+            total_pages = get_page_count(file_bytes)
+            logger.info(f"[ASYNC] PDF has {total_pages} pages")
 
-    # Create parent job
+            if user_range:
+                start_page, end_page = user_range
+                start_page = max(1, min(start_page, total_pages))
+                end_page = max(start_page, min(end_page, total_pages))
+                pages_to_process = end_page - start_page + 1
+            else:
+                pages_to_process = total_pages
+        except Exception as e:
+            logger.error(f"[ASYNC] Invalid PDF: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid PDF: {e}")
+
+    # Create job FIRST (this assigns the job_id)
     job = job_manager.create_job(
         filename=filename,
         total_pages=pages_to_process,
         user_page_range=user_range,
+        api_key=api_key,
     )
-    logger.info(f"[JOB {job.job_id}] Created: {filename}, {pages_to_process} pages, {len(available_workers)} workers available")
 
-    # Split PDF across workers
-    try:
-        split_start = time.time()
-        chunks = split_pdf_for_workers(file_bytes, len(available_workers), user_range)
-        split_elapsed = time.time() - split_start
-        # Log detailed split info
-        logger.info(f"[TIMING] JOB {job.job_id}: worker_split={split_elapsed:.3f}s for {len(chunks)} chunks")
-        logger.info(f"[JOB {job.job_id}] SPLIT: {len(chunks)} chunks across {len(chunks)} workers")
-        for i, (chunk_bytes, page_range) in enumerate(chunks):
-            worker_port = available_workers[i]
-            chunk_mb = len(chunk_bytes) / (1024 * 1024)
-            pages = page_range[1] - page_range[0] + 1
-            logger.info(f"[JOB {job.job_id}]   Chunk {i+1}: pages {page_range[0]}-{page_range[1]} ({pages} pages, {chunk_mb:.1f}MB) -> worker {worker_port}")
-    except Exception as e:
-        logger.error(f"Error splitting PDF: {e}")
-        raise HTTPException(status_code=500, detail=f"Error splitting PDF: {e}")
+    # Create job request and enqueue (non-blocking)
+    job_request = JobRequest(
+        job_id=job.job_id,
+        api_key=api_key,
+        file_bytes=file_bytes,
+        filename=filename,
+        is_pdf=is_pdf,
+        to_formats=to_formats,
+        user_range=user_range,
+        total_pages=total_pages,
+    )
+    await enqueue_job(job_request)
 
-    # Create sub-jobs and submit to workers with per-page splitting
-    job_manager.start_job(job.job_id)
-
-    async def submit_chunk(chunk_data: Tuple[bytes, Tuple[int, int]], port: int):
-        chunk_bytes, original_pages = chunk_data
-
-        # Create sub-job
-        sub_job = job_manager.add_sub_job(
-            job_id=job.job_id,
-            worker_port=port,
-            original_pages=original_pages,
-        )
-
-        # Submit with retry on failure
-        result, error = await submit_chunk_with_retry(
-            port=port,
-            chunk_bytes=chunk_bytes,
-            original_pages=original_pages,
-            filename=filename,
-            to_formats=to_formats,
-            api_key=api_key,
-            job_id=job.job_id,
-            submit_func=submit_chunk_with_page_split,
-            get_workers_for_api_key_func=get_workers_for_api_key,
-            get_worker_id_func=get_worker_id,
-            workers_dict=workers,
-        )
-
-        if error:
-            job_manager.complete_sub_job(sub_job.sub_job_id, error=error)
-            return False
-
-        # Complete sub_job with merged result immediately
-        job_manager.complete_sub_job(sub_job.sub_job_id, result=result)
-        logger.info(f"[JOB {job.job_id}] Worker {port} completed pages {original_pages[0]}-{original_pages[1]}")
-        return True
-
-    # Submit all chunks in parallel (each internally splits into pages)
-    # Update page counts NOW at assignment time (not after completion)
-    # This ensures tag_workers_for_restart() sees accurate counts when new jobs arrive
-    tasks = []
-    for i, (chunk, port) in enumerate(zip(chunks, available_workers)):
-        chunk_bytes, page_range = chunk
-        pages_for_worker = page_range[1] - page_range[0] + 1
-        worker_id = get_worker_id(port)
-        if worker_id in workers:
-            workers[worker_id]["current_life_pages"] = workers[worker_id].get("current_life_pages", 0) + pages_for_worker
-            workers[worker_id]["lifetime_pages"] = workers[worker_id].get("lifetime_pages", 0) + pages_for_worker
-            # Tag for restart if exceeded limit during this assignment
-            if workers[worker_id]["current_life_pages"] >= MAX_PAGES_BEFORE_RESTART and not workers[worker_id].get("restart_pending"):
-                workers[worker_id]["restart_pending"] = True
-                logger.info(f"[JOB {job.job_id}] {worker_id} tagged for restart (pages={workers[worker_id]['current_life_pages']} >= {MAX_PAGES_BEFORE_RESTART})")
-            load_balancer.update_worker(port, workers[worker_id])
-            logger.info(f"[JOB {job.job_id}] Assigned {pages_for_worker} pages to {worker_id}, life_pages now {workers[worker_id]['current_life_pages']}")
-        tasks.append(submit_chunk(chunk, port))
-
-    await asyncio.gather(*tasks)
+    request_elapsed = time.time() - request_start
+    logger.info(f"[ASYNC] Job {job.job_id} enqueued in {request_elapsed:.3f}s, returning immediately")
 
     return {
-        "task_id": job.job_id,  # Use parent job_id as task_id for client
+        "task_id": job.job_id,
         "status": "pending",
         "total_pages": pages_to_process,
-        "workers_used": len(chunks),
     }
 
 
@@ -1213,7 +1178,7 @@ async def convert_file_sync(
     logger.info(f"[SYNC] Received file: {filename}, size={len(file_bytes)} bytes, is_pdf={is_pdf}")
 
     # Check tier limits
-    limit_error = check_file_limits(file_bytes, api_key, is_pdf=is_pdf)
+    limit_error = check_file_limits(file_bytes, api_key, filename=filename, is_pdf=is_pdf)
     if limit_error:
         raise HTTPException(status_code=413, detail=limit_error)
 
@@ -1238,21 +1203,35 @@ async def convert_file_sync(
 
         # Poll until complete
         poll_interval = 0.5
+        worker_id = get_worker_id(coolest_port)
         try:
             while True:
                 status, _ = await poll_worker_status(coolest_port, task_id)
                 if status == "success":
                     result, error = await get_worker_result(coolest_port, task_id)
+                    # Reset worker state to ready
+                    if worker_id in workers:
+                        workers[worker_id]["state"] = "ready"
+                        workers[worker_id]["last_activity"] = time.time()
+                        load_balancer.update_worker(coolest_port, workers[worker_id])
                     if error:
                         raise HTTPException(status_code=500, detail=f"Failed to get result: {error}")
                     logger.info(f"[SYNC] Non-PDF complete")
                     return result
                 elif status == "failure":
+                    # Reset worker state to ready even on failure
+                    if worker_id in workers:
+                        workers[worker_id]["state"] = "ready"
+                        load_balancer.update_worker(coolest_port, workers[worker_id])
                     raise HTTPException(status_code=500, detail="Worker task failed")
                 await asyncio.sleep(poll_interval)
         except HTTPException:
             raise
         except Exception as e:
+            # Reset worker state on exception
+            if worker_id in workers:
+                workers[worker_id]["state"] = "ready"
+                load_balancer.update_worker(coolest_port, workers[worker_id])
             logger.warning(f"[SYNC] Worker {coolest_port} unreachable: {e}")
             raise HTTPException(status_code=502, detail=f"Worker {coolest_port} unreachable: {e}")
 
@@ -1380,7 +1359,9 @@ async def convert_source_async(
                 chunk_tasks[result["task_id"]] = worker_port
             return result
 
-    # For file_id: Get file and process
+    # For file_id: Get file and enqueue for processing
+    request_start = time.time()
+
     if file_id not in uploaded_files:
         raise HTTPException(status_code=404, detail="File not found. Upload first with /v1/upload")
 
@@ -1401,50 +1382,11 @@ async def convert_source_async(
     logger.info(f"[SOURCE] Converting uploaded file {file_id}: {filename}")
 
     # Check tier limits
-    limit_error = check_file_limits(file_bytes, api_key, is_pdf=is_pdf)
+    limit_error = check_file_limits(file_bytes, api_key, filename=filename, is_pdf=is_pdf)
     if limit_error:
         raise HTTPException(status_code=413, detail=limit_error)
 
-    # Get available workers (with detailed logging)
-    available_workers = await get_available_workers(api_key, max_wait=60)
-    if not available_workers:
-        raise HTTPException(status_code=503, detail="No workers available after 60s wait")
-
-    # Non-PDF: single worker
-    if not is_pdf:
-        coolest_port = load_balancer.select_single_worker(api_key)
-        if not coolest_port:
-            coolest_port = available_workers[0]
-
-        job = job_manager.create_job(filename=filename, total_pages=1, user_page_range=None)
-        job_manager.start_job(job.job_id)
-
-        sub_job = job_manager.add_sub_job(
-            job_id=job.job_id,
-            worker_port=coolest_port,
-            original_pages=(1, 1),
-        )
-
-        task_id, error = await submit_to_worker(coolest_port, file_bytes, filename, to_formats)
-        if error:
-            job_manager.complete_sub_job(sub_job.sub_job_id, error=error)
-            raise HTTPException(status_code=500, detail=f"Worker error: {error}")
-
-        job_manager.register_worker_task(sub_job.sub_job_id, task_id)
-
-        return {
-            "task_id": job.job_id,
-            "status": "pending",
-            "total_pages": 1,
-            "workers_used": 1,
-        }
-
-    # PDF: Split across workers
-    try:
-        total_pages = get_page_count(file_bytes)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid PDF: {e}")
-
+    # Parse user page range if provided
     user_range = None
     if page_range and len(page_range) >= 2:
         try:
@@ -1452,80 +1394,53 @@ async def convert_source_async(
         except (ValueError, IndexError):
             pass
 
-    if user_range:
-        start_page, end_page = user_range
-        start_page = max(1, min(start_page, total_pages))
-        end_page = max(start_page, min(end_page, total_pages))
-        pages_to_process = end_page - start_page + 1
-    else:
-        start_page, end_page = 1, total_pages
-        pages_to_process = total_pages
+    # For PDFs, get page count to validate and determine pages_to_process
+    total_pages = 1
+    pages_to_process = 1
+    if is_pdf:
+        try:
+            total_pages = get_page_count(file_bytes)
+            logger.info(f"[SOURCE] PDF has {total_pages} pages")
 
+            if user_range:
+                start_page, end_page = user_range
+                start_page = max(1, min(start_page, total_pages))
+                end_page = max(start_page, min(end_page, total_pages))
+                pages_to_process = end_page - start_page + 1
+            else:
+                pages_to_process = total_pages
+        except Exception as e:
+            logger.error(f"[SOURCE] Invalid PDF: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid PDF: {e}")
+
+    # Create job FIRST (this assigns the job_id)
     job = job_manager.create_job(
         filename=filename,
         total_pages=pages_to_process,
         user_page_range=user_range,
+        api_key=api_key,
     )
-    logger.info(f"[JOB {job.job_id}] Created from file_id: {filename}, {pages_to_process} pages, {len(available_workers)} workers available")
 
-    try:
-        chunks = split_pdf_for_workers(file_bytes, len(available_workers), user_range)
-        logger.info(f"[JOB {job.job_id}] SPLIT: {len(chunks)} chunks across {len(chunks)} workers")
-        for i, (chunk_bytes, pr) in enumerate(chunks):
-            worker_port = available_workers[i]
-            chunk_mb = len(chunk_bytes) / (1024 * 1024)
-            pages = pr[1] - pr[0] + 1
-            logger.info(f"[JOB {job.job_id}]   Chunk {i+1}: pages {pr[0]}-{pr[1]} ({pages} pages, {chunk_mb:.1f}MB) -> worker {worker_port}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error splitting PDF: {e}")
+    # Create job request and enqueue (non-blocking)
+    job_request = JobRequest(
+        job_id=job.job_id,
+        api_key=api_key,
+        file_bytes=file_bytes,
+        filename=filename,
+        is_pdf=is_pdf,
+        to_formats=to_formats,
+        user_range=user_range,
+        total_pages=total_pages,
+    )
+    await enqueue_job(job_request)
 
-    job_manager.start_job(job.job_id)
-
-    async def submit_chunk(chunk_data, port):
-        chunk_bytes, original_pages = chunk_data
-        sub_job = job_manager.add_sub_job(
-            job_id=job.job_id,
-            worker_port=port,
-            original_pages=original_pages,
-        )
-        # Submit with retry on failure
-        result, error = await submit_chunk_with_retry(
-            port=port,
-            chunk_bytes=chunk_bytes,
-            original_pages=original_pages,
-            filename=filename,
-            to_formats=to_formats,
-            api_key=api_key,
-            job_id=job.job_id,
-            submit_func=submit_chunk_with_page_split,
-            get_workers_for_api_key_func=get_workers_for_api_key,
-            get_worker_id_func=get_worker_id,
-            workers_dict=workers,
-        )
-        if error:
-            job_manager.complete_sub_job(sub_job.sub_job_id, error=error)
-            return False
-        job_manager.complete_sub_job(sub_job.sub_job_id, result=result)
-        logger.info(f"[JOB {job.job_id}] Worker {port} completed pages {original_pages[0]}-{original_pages[1]}")
-        return True
-
-    tasks = [submit_chunk(chunk, port) for chunk, port in zip(chunks, available_workers)]
-    await asyncio.gather(*tasks)
-
-    # Update worker page counts (both current life and lifetime)
-    for port in available_workers[:len(chunks)]:
-        worker_id = get_worker_id(port)
-        if worker_id in workers:
-            pages_for_worker = pages_to_process // len(chunks)
-            workers[worker_id]["current_life_pages"] = workers[worker_id].get("current_life_pages", 0) + pages_for_worker
-            workers[worker_id]["lifetime_pages"] = workers[worker_id].get("lifetime_pages", 0) + pages_for_worker
-            load_balancer.update_worker(port, workers[worker_id])
+    request_elapsed = time.time() - request_start
+    logger.info(f"[SOURCE] Job {job.job_id} enqueued in {request_elapsed:.3f}s, returning immediately")
 
     return {
         "task_id": job.job_id,
         "status": "pending",
         "total_pages": pages_to_process,
-        "workers_used": len(chunks),
     }
 
 
@@ -1606,20 +1521,34 @@ async def convert_source_sync(
         if error:
             raise HTTPException(status_code=500, detail=f"Worker error: {error}")
 
+        worker_id = get_worker_id(coolest_port)
         try:
             while True:
                 status, _ = await poll_worker_status(coolest_port, task_id)
                 if status == "success":
                     result, error = await get_worker_result(coolest_port, task_id)
+                    # Reset worker state to ready
+                    if worker_id in workers:
+                        workers[worker_id]["state"] = "ready"
+                        workers[worker_id]["last_activity"] = time.time()
+                        load_balancer.update_worker(coolest_port, workers[worker_id])
                     if error:
                         raise HTTPException(status_code=500, detail=f"Failed to get result: {error}")
                     return result
                 elif status == "failure":
+                    # Reset worker state to ready even on failure
+                    if worker_id in workers:
+                        workers[worker_id]["state"] = "ready"
+                        load_balancer.update_worker(coolest_port, workers[worker_id])
                     raise HTTPException(status_code=500, detail="Worker task failed")
                 await asyncio.sleep(0.5)
         except HTTPException:
             raise
         except Exception as e:
+            # Reset worker state on exception
+            if worker_id in workers:
+                workers[worker_id]["state"] = "ready"
+                load_balancer.update_worker(coolest_port, workers[worker_id])
             logger.warning(f"[SOURCE SYNC] Worker {coolest_port} unreachable: {e}")
             raise HTTPException(status_code=502, detail=f"Worker {coolest_port} unreachable: {e}")
 
@@ -1670,9 +1599,20 @@ async def convert_source_sync(
     start_time = time.time()
     completed_results = {}
 
+    # Helper to reset worker state
+    def reset_worker_state(port):
+        worker_id = get_worker_id(port)
+        if worker_id in workers:
+            workers[worker_id]["state"] = "ready"
+            workers[worker_id]["last_activity"] = time.time()
+            load_balancer.update_worker(port, workers[worker_id])
+
     try:
         while len(completed_results) < len(task_info):
             if time.time() - start_time > max_wait:
+                # Reset all worker states on timeout
+                for port, _, _ in task_info:
+                    reset_worker_state(port)
                 raise HTTPException(status_code=504, detail=f"Conversion timed out after {max_wait}s")
 
             for port, task_id, page_range_chunk in task_info:
@@ -1683,11 +1623,15 @@ async def convert_source_sync(
 
                 if status == "success":
                     result, error = await get_worker_result(port, task_id)
+                    # Reset worker state to ready
+                    reset_worker_state(port)
                     if result:
                         completed_results[task_id] = {"pages": page_range_chunk, "result": result}
                     else:
                         completed_results[task_id] = {"pages": page_range_chunk, "result": {"status": "failure", "errors": [{"message": error}]}}
                 elif status == "failure":
+                    # Reset worker state to ready even on failure
+                    reset_worker_state(port)
                     completed_results[task_id] = {"pages": page_range_chunk, "result": {"status": "failure", "errors": [{"message": "Worker reported failure"}]}}
 
             if len(completed_results) < len(task_info):
@@ -1695,6 +1639,9 @@ async def convert_source_sync(
     except HTTPException:
         raise
     except Exception as e:
+        # Reset all worker states on exception
+        for port, _, _ in task_info:
+            reset_worker_state(port)
         logger.warning(f"[SOURCE SYNC] Worker unreachable during polling: {e}")
         raise HTTPException(status_code=502, detail=f"Worker unreachable: {e}")
 
@@ -1747,11 +1694,20 @@ def _build_merged_result(job) -> dict:
             })
 
     # Use the same merge logic as sync endpoint
-    return merge_document_results(sub_results, job.filename)
+    merged = merge_document_results(sub_results, job.filename)
+
+    # Preserve summed worker time in timings, show wall clock as processing_time
+    if job.started_at and job.completed_at:
+        if "timings" not in merged:
+            merged["timings"] = {}
+        merged["timings"]["total_worker_time"] = merged["processing_time"]  # preserve summed time
+        merged["processing_time"] = job.completed_at - job.started_at  # wall clock for client
+
+    return merged
 
 
 @app.get("/v1/status/poll/{task_id}")
-async def poll_status(task_id: str, _: str = Depends(verify_api_key)):
+async def poll_status(task_id: str, api_key: str = Depends(verify_api_key)):
     """
     Poll job status.
 
@@ -1779,101 +1735,23 @@ async def poll_status(task_id: str, _: str = Depends(verify_api_key)):
     if not job:
         # Check disk storage
         if result_storage.result_exists(task_id):
-            return {"task_id": task_id, "task_status": "success"}
+            return {"task_id": task_id, "task_status": "completed"}
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # Check if job already failed (e.g., from timeout)
-    if job.status == JobStatus.FAILED:
-        duration = None
-        if job.started_at:
-            end_time = job.completed_at if job.completed_at else time.time()
-            duration = round(end_time - job.started_at, 2)
-        return {
-            "task_id": task_id,
-            "task_type": "convert",
-            "task_status": "failure",
-            "task_position": None,
-            "task_meta": None,
-            "error": job.error,
-            "received_at": epoch_to_utc(job.received_at),
-            "started_at": epoch_to_utc(job.started_at),
-            "completed_at": epoch_to_utc(job.completed_at),
-            "duration_seconds": duration,
-        }
+    # Check ownership - job must belong to this API key
+    if job.api_key and job.api_key != api_key:
+        raise HTTPException(status_code=403, detail="Access denied")
 
-    # Check all sub-jobs
-    all_complete = True
-    any_failed = False
-    sub_statuses = []
+    # Use job.status as single source of truth
+    task_status = job.status.value  # "pending", "in_progress", "completed", "failed"
 
-    for sub_job in job.sub_jobs:
-        if sub_job.status == JobStatus.IN_PROGRESS and sub_job.worker_task_id:
-            # Poll worker for actual status
-            try:
-                status, _ = await poll_worker_status(sub_job.worker_port, sub_job.worker_task_id)
-            except Exception as e:
-                # Worker unreachable - mark sub_job as failed
-                logger.warning(f"[JOB {task_id}] Worker {sub_job.worker_port} unreachable for pages {sub_job.original_pages[0]}-{sub_job.original_pages[1]}: {e}")
-                job_manager.complete_sub_job(sub_job.sub_job_id, error=f"Worker unreachable: {e}")
-                any_failed = True
-                sub_statuses.append({"pages": sub_job.original_pages, "status": "failure"})
-                continue
-
-            if status == "success":
-                # Fetch result and mark complete
-                result, error = await get_worker_result(sub_job.worker_port, sub_job.worker_task_id)
-                if result:
-                    job_manager.complete_sub_job(sub_job.sub_job_id, result=result)
-                    logger.info(f"[JOB {task_id}] Worker {sub_job.worker_port} completed pages {sub_job.original_pages[0]}-{sub_job.original_pages[1]}")
-                else:
-                    job_manager.complete_sub_job(sub_job.sub_job_id, error=error)
-                    logger.warning(f"[JOB {task_id}] Worker {sub_job.worker_port} failed to return result: {error}")
-                    any_failed = True
-                # Mark worker as ready
-                wid = get_worker_id(sub_job.worker_port)
-                if wid in workers:
-                    workers[wid]["state"] = "ready"
-                    load_balancer.update_worker(sub_job.worker_port, workers[wid])
-            elif status == "failure":
-                job_manager.complete_sub_job(sub_job.sub_job_id, error="Worker task failed")
-                logger.error(f"[JOB {task_id}] Worker {sub_job.worker_port} FAILED for pages {sub_job.original_pages[0]}-{sub_job.original_pages[1]}")
-                any_failed = True
-                # Mark worker as ready even on failure
-                wid = get_worker_id(sub_job.worker_port)
-                if wid in workers:
-                    workers[wid]["state"] = "ready"
-                    load_balancer.update_worker(sub_job.worker_port, workers[wid])
-            else:
-                all_complete = False
-
-            sub_statuses.append({"pages": sub_job.original_pages, "status": status})
-
-        elif sub_job.status == JobStatus.PENDING:
-            all_complete = False
-            sub_statuses.append({"pages": sub_job.original_pages, "status": "pending"})
-
-        elif sub_job.status == JobStatus.COMPLETED:
-            sub_statuses.append({"pages": sub_job.original_pages, "status": "success"})
-
-        elif sub_job.status == JobStatus.FAILED:
-            any_failed = True
-            sub_statuses.append({"pages": sub_job.original_pages, "status": "failure"})
-
-    # Determine overall status and save results when complete
-    if all_complete and not any_failed:
-        task_status = "success"
-        # Save merged results to disk if not already saved
-        if not result_storage.result_exists(task_id):
-            merged = _build_merged_result(job)
-            result_storage.save_result(task_id, merged)
-            result_mb = len(str(merged)) / (1024 * 1024)
-            duration_so_far = time.time() - job.started_at if job.started_at else 0
-            logger.info(f"[JOB {task_id}] COMPLETE: {job.total_pages} pages, {len(job.sub_jobs)} workers, {duration_so_far:.1f}s, result={result_mb:.1f}MB")
-    elif any_failed and all_complete:
-        task_status = "failure"
-        logger.error(f"[JOB {task_id}] FAILED: some workers failed")
-    else:
-        task_status = "started"
+    # Save results to disk when completed (if not already saved)
+    if job.status == JobStatus.COMPLETED and not result_storage.result_exists(task_id):
+        merged = _build_merged_result(job)
+        result_storage.save_result(task_id, merged)
+        result_mb = len(str(merged)) / (1024 * 1024)
+        duration_so_far = time.time() - job.started_at if job.started_at else 0
+        logger.info(f"[JOB {task_id}] COMPLETE: {job.total_pages} pages, {len(job.sub_jobs)} workers, {duration_so_far:.1f}s, result={result_mb:.1f}MB")
 
     # Calculate duration
     duration = None
@@ -1881,14 +1759,13 @@ async def poll_status(task_id: str, _: str = Depends(verify_api_key)):
         end_time = job.completed_at if job.completed_at else time.time()
         duration = round(end_time - job.started_at, 2)
 
-    # Return worker-compatible format with our timing additions
     return {
         "task_id": task_id,
         "task_type": "convert",
         "task_status": task_status,
         "task_position": None,
         "task_meta": None,
-        # Our additions for timing visibility
+        "error": job.error,
         "received_at": epoch_to_utc(job.received_at),
         "started_at": epoch_to_utc(job.started_at),
         "completed_at": epoch_to_utc(job.completed_at),
@@ -1897,7 +1774,7 @@ async def poll_status(task_id: str, _: str = Depends(verify_api_key)):
 
 
 @app.get("/v1/result/{task_id}")
-async def get_result(task_id: str, verbose: bool = False, _: str = Depends(verify_api_key)):
+async def get_result(task_id: str, verbose: bool = False, api_key: str = Depends(verify_api_key)):
     """
     Get job result in standard docling-serve format.
 
@@ -1940,13 +1817,17 @@ async def get_result(task_id: str, verbose: bool = False, _: str = Depends(verif
 
         # Strip detailed timings unless verbose
         if not verbose and "timings" in disk_result:
-            disk_result = {**disk_result, "timings": {}}
+            disk_result = {k: v for k, v in disk_result.items() if k != "timings"}
         return disk_result
 
     job = job_manager.get_job(task_id)
 
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    # Check ownership - job must belong to this API key
+    if job.api_key and job.api_key != api_key:
+        raise HTTPException(status_code=403, detail="Access denied")
 
     if job.status != JobStatus.COMPLETED:
         raise HTTPException(status_code=400, detail=f"Job not complete: {job.status.value}")
@@ -1962,8 +1843,8 @@ async def get_result(task_id: str, verbose: bool = False, _: str = Depends(verif
     result_storage.save_result(task_id, merged)
 
     # Strip detailed timings unless verbose
-    if not verbose:
-        merged = {**merged, "timings": {}}
+    if not verbose and "timings" in merged:
+        merged = {k: v for k, v in merged.items() if k != "timings"}
 
     return merged
 
@@ -2159,6 +2040,12 @@ async def watchdog():
 
                 except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
                     logger.info(f"[WATCHDOG] {worker_id}: psutil exception: {e}")
+
+                # Check for failed state (set when submit_to_worker fails)
+                if worker["state"] == "failed":
+                    logger.info(f"[WATCHDOG] {worker_id}: state=failed, triggering restart...")
+                    await restart_worker(worker_id, reason="submit_failed")
+                    continue
 
                 # Check restart_pending tag (set during job assignment when page limit reached)
                 # TAG-based restart: worker was tagged for restart, now waiting for it to be idle

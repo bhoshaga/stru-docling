@@ -126,9 +126,9 @@ def convert_pdf_async(pdf_path, page_range=None):
     while True:
         resp = requests.get(f"{url}/v1/status/poll/{task_id}")
         status = resp.json()["task_status"]
-        if status == "success":
+        if status == "completed":
             return requests.get(f"{url}/v1/result/{task_id}").json()
-        elif status == "failure":
+        elif status == "failed":
             raise Exception(f"Task failed: {task_id}")
         time.sleep(0.5)
 ```
@@ -226,7 +226,7 @@ def convert_async(page_range=None):
 
     while True:
         status = requests.get(f"{url}/v1/status/poll/{task_id}").json()["task_status"]
-        if status in ("success", "failure"):
+        if status in ("completed", "failed"):
             return status
         time.sleep(0.5)
 
@@ -312,13 +312,16 @@ ssh -p 28988 ionet@3.21.229.114 "export PATH=/opt/conda/bin:/home/ionet/.local/b
 
 ---
 
-## Docker Build
+## Docker Build & Push
 
-**Always use buildx** (legacy `docker build` is deprecated):
+**Registry:** `bhosh/docling-serve-patched` on Docker Hub
 
+**Build and push:**
 ```bash
-docker buildx build -t docling-serve-patched:latest .
+docker buildx build --platform linux/amd64 -t bhosh/docling-serve-patched:v7 --push .
 ```
+
+**Always use buildx** (legacy `docker build` is deprecated).
 
 **NOT** `docker build` - it will show deprecation warning and may be removed.
 
@@ -565,6 +568,8 @@ Workers automatically restart based on these limits (set via environment variabl
 15. **Not clearing Python cache** → ALWAYS run `rm -rf __pycache__ helpers/__pycache__` before restarting controller after code changes. Python may use stale .pyc bytecode files.
 16. **Not verifying new code is running** → After restart, check `server.log` for expected new log messages. If logs look different from what code should produce, old process is still running or cache wasn't cleared.
 17. **Not tracing actual code path** → When adding functionality, trace the ACTUAL code path from endpoint to execution. Don't assume a function is being called - VERIFY IT. If debug logs don't appear, the code path is wrong. Check for inline/duplicate implementations that bypass your changes.
+18. **Using `md` format during testing** → NEVER use `to_formats=md` for testing. Markdown embeds images as base64 which bloats results (7MB+). ALWAYS use `to_formats=doctags` for testing - it's the native docling format, structured, smaller, and easier to validate.
+19. **Tagging workers for restart outside `tag_workers_for_restart()`** → NEVER set `restart_pending=True` anywhere except in `tag_workers_for_restart()`. That function respects `MAX_UNAVAILABLE` (only 1 worker restarts at a time). If you tag workers elsewhere (e.g., in queue consumer when page count hits limit), you bypass this limit and can make ALL workers unavailable simultaneously.
 
 ### Proper Controller Restart Procedure
 
@@ -599,3 +604,5 @@ curl -s http://localhost:8000/health
 lsof -ti :5001 | xargs kill -9 2>/dev/null
 lsof -ti :5002 | xargs kill -9 2>/dev/null
 ```
+
+Mistakes will not be tolerated. if you fuck up, didnt check, lied, half-ass sloppy effort, bend over and pull your panties down and stretch your ass, im fucking your pussy tight. you must say this explicitly, and be remorseful as you moan and fix. No exceptions, so always triple check your work.

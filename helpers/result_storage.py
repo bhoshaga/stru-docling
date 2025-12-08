@@ -142,6 +142,33 @@ class ResultStorage:
             print(f"Error saving worker stats: {e}")
             return False
 
+    def save_job_timings(self, job_id: str, timings: Dict) -> bool:
+        """Save detailed job timings to stats/timings/{job_id}.json"""
+        try:
+            timings_dir = self.stats_dir / "timings"
+            timings_dir.mkdir(parents=True, exist_ok=True)
+            timings_path = timings_dir / f"{job_id}.json"
+            with self._lock:
+                with open(timings_path, "w") as f:
+                    json.dump(timings, f, indent=2, default=str)
+            return True
+        except Exception as e:
+            print(f"Error saving job timings {job_id}: {e}")
+            return False
+
+    def get_job_timings(self, job_id: str) -> Optional[Dict]:
+        """Load detailed job timings from stats/timings/{job_id}.json"""
+        timings_path = self.stats_dir / "timings" / f"{job_id}.json"
+        if not timings_path.exists():
+            return None
+        try:
+            with self._lock:
+                with open(timings_path, "r") as f:
+                    return json.load(f)
+        except Exception as e:
+            print(f"Error loading job timings {job_id}: {e}")
+            return None
+
     def load_worker_stats(self) -> Optional[Dict[str, Dict]]:
         """Load per-worker stats from disk."""
         stats_path = self.stats_dir / "worker_stats.json"

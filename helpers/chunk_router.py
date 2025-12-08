@@ -70,8 +70,8 @@ async def _proxy_chunk_request(
     filename = files.filename or "document.pdf"
     is_pdf = filename.lower().endswith(".pdf")
 
-    # Check tier limits
-    limit_error = _check_file_limits(file_bytes, api_key, is_pdf=is_pdf)
+    # Check tier limits and file type
+    limit_error = _check_file_limits(file_bytes, api_key, filename=filename, is_pdf=is_pdf)
     if limit_error:
         raise HTTPException(status_code=413, detail=limit_error)
 

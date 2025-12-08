@@ -1,11 +1,12 @@
 """
 PDF utilities for page splitting and counting.
+
+Uses PyMuPDF (fitz) for ~10x faster PDF operations compared to pypdf.
 """
 from concurrent.futures import ThreadPoolExecutor
-from io import BytesIO
 from typing import List, Tuple
 
-from pypdf import PdfReader, PdfWriter
+import fitz  # PyMuPDF
 
 # Thread pool for parallel PDF operations
 _pdf_pool = ThreadPoolExecutor(max_workers=8)
@@ -13,21 +14,23 @@ _pdf_pool = ThreadPoolExecutor(max_workers=8)
 
 def get_page_count(pdf_bytes: bytes) -> int:
     """Get the number of pages in a PDF."""
-    reader = PdfReader(BytesIO(pdf_bytes))
-    return len(reader.pages)
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    count = doc.page_count
+    doc.close()
+    return count
 
 
 def get_page_sizes(pdf_bytes: bytes) -> List[int]:
     """Get the size in bytes of each page (approximate via content streams)."""
-    reader = PdfReader(BytesIO(pdf_bytes))
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     sizes = []
-    for page in reader.pages:
-        # Approximate size by serializing page to bytes
-        writer = PdfWriter()
-        writer.add_page(page)
-        buf = BytesIO()
-        writer.write(buf)
-        sizes.append(buf.tell())
+    for i in range(doc.page_count):
+        # Approximate size by extracting single page
+        single = fitz.open()
+        single.insert_pdf(doc, from_page=i, to_page=i)
+        sizes.append(len(single.tobytes()))
+        single.close()
+    doc.close()
     return sizes
 
 
@@ -43,17 +46,16 @@ def extract_pages(pdf_bytes: bytes, start_page: int, end_page: int) -> bytes:
     Returns:
         New PDF containing only the specified pages as bytes
     """
-    reader = PdfReader(BytesIO(pdf_bytes))
-    writer = PdfWriter()
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    output = fitz.open()
 
-    # Convert to 0-indexed
-    for i in range(start_page - 1, end_page):
-        if i < len(reader.pages):
-            writer.add_page(reader.pages[i])
+    # PyMuPDF uses 0-indexed pages
+    output.insert_pdf(doc, from_page=start_page - 1, to_page=end_page - 1)
 
-    output = BytesIO()
-    writer.write(output)
-    return output.getvalue()
+    result = output.tobytes()
+    output.close()
+    doc.close()
+    return result
 
 
 def split_page_ranges(total_pages: int, num_workers: int, user_range: Tuple[int, int] = None) -> List[Tuple[int, int]]:

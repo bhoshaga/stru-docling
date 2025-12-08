@@ -47,6 +47,18 @@ from .worker_router import (
 from .retry_handler import (
     submit_chunk_with_retry,
 )
+from .file_validation import (
+    validate_file_type,
+    is_supported_file,
+    SUPPORTED_EXTENSIONS,
+)
+from .job_queue import (
+    JobRequest,
+    init_queue as init_job_queue,
+    enqueue_job,
+    job_queue_consumer,
+    get_queue_stats,
+)
 
 __all__ = [
     # PDF utils
@@ -85,4 +97,14 @@ __all__ = [
     "init_worker_router",
     # Retry handler
     "submit_chunk_with_retry",
+    # File validation
+    "validate_file_type",
+    "is_supported_file",
+    "SUPPORTED_EXTENSIONS",
+    # Job queue
+    "JobRequest",
+    "init_job_queue",
+    "enqueue_job",
+    "job_queue_consumer",
+    "get_queue_stats",
 ]

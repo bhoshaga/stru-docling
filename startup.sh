@@ -22,6 +22,17 @@ echo "=== Docling Controller Startup ==="
 echo "  Device: ${DOCLING_DEVICE:-cpu}"
 echo "  Threads per worker: $THREADS_PER_WORKER"
 
+# Start Cloudflare Tunnel early (doesn't depend on workers)
+# Token can be passed via TUNNEL_TOKEN env var or /app/cert.pem file
+if [ -n "$TUNNEL_TOKEN" ]; then
+    echo "Starting Cloudflare Tunnel (from env var)..."
+    cloudflared tunnel --url http://localhost:8000 run --token "$TUNNEL_TOKEN" &
+elif [ -f /app/cert.pem ]; then
+    echo "Starting Cloudflare Tunnel (from cert.pem)..."
+    TUNNEL_TOKEN=$(cat /app/cert.pem | tr -d '\n')
+    cloudflared tunnel --url http://localhost:8000 run --token "$TUNNEL_TOKEN" &
+fi
+
 if [ "$NUM_WORKERS" -gt 0 ]; then
     echo "  Starting $NUM_WORKERS workers on ports $WORKER_START_PORT-$((WORKER_START_PORT + NUM_WORKERS - 1))"
 
@@ -32,13 +43,9 @@ if [ "$NUM_WORKERS" -gt 0 ]; then
 
         DOCLING_SERVE_ENG_LOC_NUM_WORKERS=$THREADS_PER_WORKER \
         docling-serve run --host 0.0.0.0 --port $port &
-
-        # Small delay to avoid thundering herd on model loading
-        sleep 1
     done
 
-    echo "All workers started. Waiting for them to be ready..."
-    sleep 10
+    echo "All workers started."
 else
     echo "  NUM_WORKERS=0: No workers started. Use /add endpoint to add workers."
 fi
@@ -46,18 +53,32 @@ fi
 echo "Starting controller API on port 8000..."
 cd /app && python -m uvicorn controller:app --host 0.0.0.0 --port 8000 &
 
-# Start Cloudflare Tunnel if cert exists
-if [ -f /app/cert.pem ]; then
-    echo "Starting Cloudflare Tunnel (api.rundocling.com)..."
-    # Extract token from PEM file (strip headers) and run tunnel
-    TUNNEL_TOKEN=$(grep -v "ARGO TUNNEL TOKEN" /app/cert.pem | tr -d '\n')
-    cloudflared tunnel run --token "$TUNNEL_TOKEN" &
-fi
+# Wait for all workers to be ready
+echo "Waiting for workers to be ready..."
+workers_ready=""
+while true; do
+    ready=0
+    for i in $(seq 0 $((NUM_WORKERS - 1))); do
+        port=$((WORKER_START_PORT + i))
+        if curl -s http://localhost:$port/health > /dev/null 2>&1; then
+            ready=$((ready + 1))
+            if ! echo "$workers_ready" | grep -q ":$port:"; then
+                echo "  Worker $port ready"
+                workers_ready="$workers_ready:$port:"
+            fi
+        fi
+    done
+    if [ $ready -eq $NUM_WORKERS ]; then
+        break
+    fi
+    sleep 1
+done
 
-echo "=== Startup complete ==="
+echo "Server ready."
+echo ""
 echo "Controller: http://0.0.0.0:8000 (local)"
 echo "Public URL: https://api.rundocling.com"
-echo "Log file: /data/controller.log"
+echo "Log file: /app/server.log"
 echo "Endpoints:"
 echo "  POST /v1/convert/file/async     - Convert PDF with page splitting"
 echo "  GET  /v1/status/poll/{id}       - Poll job status"

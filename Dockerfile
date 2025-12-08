@@ -2,7 +2,7 @@
 # Multi-worker setup with controller API v2
 #
 # BUILD WITH BUILDX (legacy docker build is deprecated):
-#   docker buildx build -t docling-serve-patched:v6 .
+#   docker buildx build --platform linux/amd64 -t docling-serve-patched:v7 .
 
 FROM python:3.13-slim
 
@@ -29,7 +29,8 @@ RUN pip install --no-cache-dir \
     onnxruntime \
     httpx \
     psutil \
-    pypdf
+    pypdf \
+    pymupdf
 
 # Copy prebuilt GIL-patched binary and overwrite stock version
 COPY prebuilt/linux_x86_64_cp313/pdf_parsers.cpython-313-x86_64-linux-gnu.so /tmp/
@@ -60,7 +61,7 @@ ENV DOCLING_DEVICE=cuda
 ENV NUM_WORKERS=10
 ENV DOCLING_SERVE_ENG_LOC_NUM_WORKERS=2
 ENV DOCLING_DEBUG_PROFILE_PIPELINE_TIMINGS=true
-ENV LOG_FILE=/data/controller.log
+ENV LOG_FILE=/app/server.log
 ENV RESULT_STORAGE_DIR=/data
 
 # Expose controller port

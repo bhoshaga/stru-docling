@@ -40,6 +40,7 @@ class SubJob:
 class Job:
     """A parent job that may be split across multiple workers."""
     job_id: str
+    api_key: Optional[str] = None  # Creator's API key for access control
     status: JobStatus = JobStatus.PENDING
     received_at: float = field(default_factory=time.time)
     started_at: Optional[float] = None
@@ -112,11 +113,13 @@ class JobManager:
         filename: Optional[str] = None,
         total_pages: int = 0,
         user_page_range: Optional[tuple] = None,
+        api_key: Optional[str] = None,
     ) -> Job:
         """Create a new parent job."""
         job_id = str(uuid.uuid4())
         job = Job(
             job_id=job_id,
+            api_key=api_key,
             filename=filename,
             total_pages=total_pages,
             user_page_range=user_page_range,
@@ -290,9 +293,9 @@ class JobManager:
             logger.info(f"[DEBUG]   Total jobs in _jobs: {len(self._jobs)}")
             pending = []
             for job_id, job in self._jobs.items():
-                logger.info(f"[DEBUG]   Job {job_id[:8]}...: status={job.status.value}, sub_jobs={len(job.sub_jobs)}")
+                logger.info(f"[DEBUG]   Job {job_id}: status={job.status.value}, sub_jobs={len(job.sub_jobs)}")
                 for sj in job.sub_jobs:
-                    logger.info(f"[DEBUG]     SubJob {sj.sub_job_id[:8]}...: port={sj.worker_port}, status={sj.status.value}, task_id={sj.worker_task_id[:8] if sj.worker_task_id else None}")
+                    logger.info(f"[DEBUG]     SubJob {sj.sub_job_id}: port={sj.worker_port}, status={sj.status.value}, task_id={sj.worker_task_id}")
                     if sj.worker_port == worker_port and sj.status == JobStatus.IN_PROGRESS:
                         pending.append((job_id, sj))
                         logger.info(f"[DEBUG]       -> MATCHED! Added to pending")

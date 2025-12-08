@@ -43,6 +43,7 @@ def merge_document_results(sub_results: List[dict], filename: str) -> dict:
     total_time = 0
     all_errors = []
     all_timings = {"per_page": []}
+    all_failed_pages = []
     has_success = False
 
     # Track content to merge
@@ -61,10 +62,12 @@ def merge_document_results(sub_results: List[dict], filename: str) -> dict:
         if result.get("status") == "success":
             has_success = True
 
-        # Aggregate times and errors
+        # Aggregate times, errors, and failed pages
         page_processing_time = result.get("processing_time", 0)
         total_time += page_processing_time
         all_errors.extend(result.get("errors", []))
+        if result.get("failed_pages"):
+            all_failed_pages.extend(result["failed_pages"])
 
         # Collect per-page timings (keep ALL page timings)
         page_timings = result.get("timings", {})
@@ -100,13 +103,27 @@ def merge_document_results(sub_results: List[dict], filename: str) -> dict:
     if json_contents:
         merged_doc["json_content"] = _merge_json_content(json_contents, filename)
 
-    return {
+    # Determine final status
+    if all_failed_pages:
+        status = "partial"  # Some pages failed
+    elif has_success:
+        status = "success"  # All pages succeeded
+    else:
+        status = "failure"  # No pages succeeded
+
+    result = {
         "document": merged_doc,
-        "status": "success" if has_success else "failure",
+        "status": status,
         "errors": all_errors,
         "processing_time": total_time,
         "timings": all_timings,
     }
+
+    # Include failed_pages if any
+    if all_failed_pages:
+        result["failed_pages"] = sorted(all_failed_pages, key=lambda x: x.get("page", 0))
+
+    return result
 
 
 def _merge_json_content(json_contents: List[Tuple[tuple, dict]], filename: str) -> dict:

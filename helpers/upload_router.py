@@ -73,14 +73,14 @@ async def upload_file(
     # Calculate SHA256 hash for deduplication
     file_hash = hashlib.sha256(file_bytes).hexdigest()
 
-    logger.info(f"[UPLOAD] Received file: {original_filename}, size={file_size} bytes, hash={file_hash[:16]}..., api_key={api_key}")
+    logger.info(f"[UPLOAD] Received file: {original_filename}, size={file_size} bytes, hash={file_hash}, api_key={api_key}")
 
     # Check if file already uploaded (same hash)
     if file_hash in hash_to_file_id:
         existing_file_id = hash_to_file_id[file_hash]
         existing_info = uploaded_files.get(existing_file_id)
         if existing_info and os.path.exists(existing_info["filepath"]):
-            logger.info(f"[UPLOAD] Duplicate detected: hash={file_hash[:16]}... already exists as file_id={existing_file_id}")
+            logger.info(f"[UPLOAD] Duplicate detected: hash={file_hash} already exists as file_id={existing_file_id}")
             return {
                 "file_id": existing_file_id,
                 "filename": original_filename,
@@ -94,8 +94,8 @@ async def upload_file(
             if existing_file_id in uploaded_files:
                 del uploaded_files[existing_file_id]
 
-    # Check tier limits
-    limit_error = _check_file_limits(file_bytes, api_key, is_pdf=is_pdf)
+    # Check tier limits and file type
+    limit_error = _check_file_limits(file_bytes, api_key, filename=original_filename, is_pdf=is_pdf)
     if limit_error:
         raise HTTPException(status_code=413, detail=limit_error)
 
@@ -126,7 +126,7 @@ async def upload_file(
     # Register hash mapping for deduplication
     hash_to_file_id[file_hash] = file_id
 
-    logger.info(f"[UPLOAD] Saved file as {file_id}{ext} (original: {original_filename}, hash={file_hash[:16]}...)")
+    logger.info(f"[UPLOAD] Saved file as {file_id}{ext} (original: {original_filename}, hash={file_hash})")
 
     return {
         "file_id": file_id,
@@ -158,7 +158,7 @@ def cleanup_old_uploads(max_age_seconds: int = 3600) -> int:
             if os.path.exists(info["filepath"]):
                 try:
                     os.remove(info["filepath"])
-                    logger.info(f"[UPLOAD] Cleaned up old file: {file_id} (hash={file_hash[:16] if file_hash else 'N/A'}...)")
+                    logger.info(f"[UPLOAD] Cleaned up old file: {file_id} (hash={file_hash if file_hash else 'N/A'})")
                 except Exception as e:
                     logger.warning(f"[UPLOAD] Failed to delete file {file_id}: {e}")
 
