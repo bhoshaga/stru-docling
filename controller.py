@@ -93,10 +93,30 @@ from helpers import (
 # CONFIGURATION
 # =============================================================================
 
+# Platform detection
+import platform
+IS_MACOS = platform.system() == "Darwin"
+IS_LINUX = platform.system() == "Linux"
+
+# Valid OCR engines (ocrmac only works on macOS)
+VALID_OCR_ENGINES = ["auto", "easyocr", "rapidocr", "tesserocr", "tesseract"]
+if IS_MACOS:
+    VALID_OCR_ENGINES.append("ocrmac")
+
+
+def validate_ocr_engine(ocr_engine: str) -> str:
+    """Validate OCR engine, return error message if invalid, None if OK."""
+    if ocr_engine == "ocrmac" and not IS_MACOS:
+        return "ocrmac is only available on macOS. Use easyocr, tesseract, rapidocr, or auto instead."
+    if ocr_engine not in VALID_OCR_ENGINES and ocr_engine != "ocrmac":
+        return f"Invalid ocr_engine '{ocr_engine}'. Valid options: {', '.join(VALID_OCR_ENGINES)}"
+    return None
+
+
 # Watchdog settings
 MAX_PAGES_BEFORE_RESTART = int(os.environ.get("MAX_PAGES_BEFORE_RESTART", "10"))
 MAX_MEMORY_MB = int(os.environ.get("MAX_MEMORY_MB", "12000"))
-MAX_UNAVAILABLE = int(os.environ.get("MAX_UNAVAILABLE", "1"))  # Max workers that can be down at once
+# MAX_UNAVAILABLE is set dynamically after NUM_WORKERS (see below)
 REQUEST_TIMEOUT_SEC = int(os.environ.get("REQUEST_TIMEOUT_SEC", "600"))
 IDLE_RESTART_SEC = int(os.environ.get("IDLE_RESTART_SEC", "3600"))
 JOB_TIMEOUT_SEC = int(os.environ.get("JOB_TIMEOUT_SEC", "600"))  # 10 minutes
@@ -104,23 +124,31 @@ JOB_TIMEOUT_SEC = int(os.environ.get("JOB_TIMEOUT_SEC", "600"))  # 10 minutes
 # Worker settings
 WORKER_HOST = "127.0.0.1"
 NUM_THREADS_PER_WORKER = int(os.environ.get("DOCLING_SERVE_ENG_LOC_NUM_WORKERS", "2"))
+NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "10"))
 MIN_PORT = 5001
-MAX_PORT = 5010
-NUM_WORKERS = MAX_PORT - MIN_PORT + 1
+MAX_PORT = MIN_PORT + NUM_WORKERS - 1
 
-# API authentication - Two tiers with limits
-# "windowseat" = dedicated tier (8 workers: ports 5001-5008)
-# "middleseat" = shared/free tier (2 workers: ports 5009-5010)
+# Dynamic MAX_UNAVAILABLE: 30% of workers, minimum 1, can be overridden by env
+_default_max_unavailable = max(1, int(NUM_WORKERS * 0.3))
+MAX_UNAVAILABLE = int(os.environ.get("MAX_UNAVAILABLE", str(_default_max_unavailable)))
+
+# API authentication - Two tiers with limits (dynamic allocation)
+# 80% dedicated, 20% shared (minimum 1 shared)
+_num_shared = max(1, int(NUM_WORKERS * 0.2))
+_num_dedicated = NUM_WORKERS - _num_shared
+_dedicated_ports = list(range(MIN_PORT, MIN_PORT + _num_dedicated))
+_shared_ports = list(range(MIN_PORT + _num_dedicated, MAX_PORT + 1))
+
 API_KEYS = {
     "windowseat": {
         "tier": "dedicated",
-        "workers": list(range(5001, 5009)),  # 8 workers
+        "workers": _dedicated_ports,  # 80% of workers
         "max_file_mb": 200,  # Max file size in MB
         "max_pages": 400,    # Max pages per PDF
     },
     "middleseat": {
         "tier": "shared",
-        "workers": list(range(5009, 5011)),  # 2 workers
+        "workers": _shared_ports,  # 20% of workers
         "max_file_mb": 20,   # Max file size in MB
         "max_pages": 20,     # Max pages per PDF
     },
@@ -779,6 +807,13 @@ async def submit_to_worker(
     to_formats: str = "json",
     image_export_mode: str = "embedded",
     include_images: bool = True,
+    do_ocr: bool = True,
+    force_ocr: bool = False,
+    ocr_engine: str = "easyocr",
+    ocr_lang: Optional[str] = None,
+    do_table_structure: bool = True,
+    table_mode: str = "fast",
+    pipeline: str = "standard",
 ) -> Tuple[Optional[str], Optional[str]]:
     """
     Submit a PDF chunk to a worker.
@@ -787,7 +822,10 @@ async def submit_to_worker(
         (task_id, error) - task_id if successful, error message if failed
     """
     url = f"http://{WORKER_HOST}:{port}/v1/convert/file/async"
-    logger.info(f"Submitting to worker {port}: {len(pdf_bytes)} bytes, format={to_formats}, image_export_mode={image_export_mode}, include_images={include_images}")
+    logger.info(f"Submitting to worker {port}: {len(pdf_bytes)} bytes, format={to_formats}, "
+                f"do_ocr={do_ocr}, force_ocr={force_ocr}, ocr_engine={ocr_engine}, ocr_lang={ocr_lang}, "
+                f"do_table_structure={do_table_structure}, table_mode={table_mode}, pipeline={pipeline}, "
+                f"image_export_mode={image_export_mode}, include_images={include_images}")
 
     # Update worker state and activity when job is submitted
     worker_id = get_worker_id(port)
@@ -803,8 +841,16 @@ async def submit_to_worker(
             data = {
                 "to_formats": to_formats,
                 "image_export_mode": image_export_mode,
-                "include_images": str(include_images).lower(),  # Form data needs string
+                "include_images": str(include_images).lower(),
+                "do_ocr": str(do_ocr).lower(),
+                "force_ocr": str(force_ocr).lower(),
+                "ocr_engine": ocr_engine,
+                "do_table_structure": str(do_table_structure).lower(),
+                "table_mode": table_mode,
+                "pipeline": pipeline,
             }
+            if ocr_lang:
+                data["ocr_lang"] = ocr_lang
 
             response = await client.post(url, files=files, data=data)
 
@@ -908,6 +954,13 @@ async def submit_chunk_with_page_split(
     to_formats: str,
     image_export_mode: str = "embedded",
     include_images: bool = True,
+    do_ocr: bool = True,
+    force_ocr: bool = False,
+    ocr_engine: str = "easyocr",
+    ocr_lang: Optional[str] = None,
+    do_table_structure: bool = True,
+    table_mode: str = "fast",
+    pipeline: str = "standard",
 ) -> Tuple[Optional[dict], Optional[str]]:
     """
     Submit a chunk by splitting into individual pages, running in parallel on the same worker,
@@ -928,7 +981,7 @@ async def submit_chunk_with_page_split(
 
     # If only 1 page, no split needed - direct submission + poll + get result
     if num_pages == 1:
-        task_id, error = await submit_to_worker(port, chunk_bytes, filename, to_formats, image_export_mode, include_images)
+        task_id, error = await submit_to_worker(port, chunk_bytes, filename, to_formats, image_export_mode, include_images, do_ocr, force_ocr, ocr_engine, ocr_lang, do_table_structure, table_mode, pipeline)
         if error:
             return None, error
 
@@ -980,7 +1033,7 @@ async def submit_chunk_with_page_split(
     # Submit all pages in parallel (I/O-bound)
     submit_start = time.time()
     async def submit_single_page(page_bytes: bytes, page_num: int):
-        task_id, error = await submit_to_worker(port, page_bytes, filename, to_formats, image_export_mode, include_images)
+        task_id, error = await submit_to_worker(port, page_bytes, filename, to_formats, image_export_mode, include_images, do_ocr, force_ocr, ocr_engine, ocr_lang, do_table_structure, table_mode, pipeline)
         return (task_id, page_num, error)
 
     submit_tasks = [
@@ -1094,6 +1147,13 @@ async def convert_file_async(
     page_range: Optional[List[str]] = Form(None),
     image_export_mode: str = Form("embedded"),
     include_images: bool = Form(True),
+    do_ocr: bool = Form(True),
+    force_ocr: bool = Form(False),
+    ocr_engine: str = Form("easyocr"),
+    ocr_lang: Optional[str] = Form(None),
+    do_table_structure: bool = Form(True),
+    table_mode: str = Form("fast"),
+    pipeline: str = Form("standard"),
     api_key: str = Depends(verify_api_key),
 ):
     """
@@ -1119,6 +1179,11 @@ async def convert_file_async(
     limit_error = check_file_limits(file_bytes, api_key, filename=filename, is_pdf=is_pdf)
     if limit_error:
         raise HTTPException(status_code=413, detail=limit_error)
+
+    # Validate OCR engine (ocrmac only works on macOS)
+    ocr_error = validate_ocr_engine(ocr_engine)
+    if ocr_error:
+        raise HTTPException(status_code=400, detail=ocr_error)
 
     # Parse user page range if provided
     user_range = None
@@ -1167,6 +1232,13 @@ async def convert_file_async(
         total_pages=total_pages,
         image_export_mode=image_export_mode,
         include_images=include_images,
+        do_ocr=do_ocr,
+        force_ocr=force_ocr,
+        ocr_engine=ocr_engine,
+        ocr_lang=ocr_lang,
+        do_table_structure=do_table_structure,
+        table_mode=table_mode,
+        pipeline=pipeline,
     )
     await enqueue_job(job_request)
 
@@ -1188,6 +1260,13 @@ async def convert_file_sync(
     page_range: Optional[List[str]] = Form(None),
     image_export_mode: str = Form("embedded"),
     include_images: bool = Form(True),
+    do_ocr: bool = Form(True),
+    force_ocr: bool = Form(False),
+    ocr_engine: str = Form("easyocr"),
+    ocr_lang: Optional[str] = Form(None),
+    do_table_structure: bool = Form(True),
+    table_mode: str = Form("fast"),
+    pipeline: str = Form("standard"),
     api_key: str = Depends(verify_api_key),
 ):
     """
@@ -1207,6 +1286,11 @@ async def convert_file_sync(
     if limit_error:
         raise HTTPException(status_code=413, detail=limit_error)
 
+    # Validate OCR engine (ocrmac only works on macOS)
+    ocr_error = validate_ocr_engine(ocr_engine)
+    if ocr_error:
+        raise HTTPException(status_code=400, detail=ocr_error)
+
     # Get available workers (with detailed logging)
     available_workers = await get_available_workers(api_key, max_wait=60)
     if not available_workers:
@@ -1222,7 +1306,7 @@ async def convert_file_sync(
         logger.info(f"[SYNC] Non-PDF file, routing to single worker: {coolest_port}")
 
         # Submit to worker
-        task_id, error = await submit_to_worker(coolest_port, file_bytes, filename, to_formats, image_export_mode, include_images)
+        task_id, error = await submit_to_worker(coolest_port, file_bytes, filename, to_formats, image_export_mode, include_images, do_ocr, force_ocr, ocr_engine, ocr_lang, do_table_structure, table_mode, pipeline)
         if error:
             raise HTTPException(status_code=500, detail=f"Worker error: {error}")
 
@@ -1298,7 +1382,8 @@ async def convert_file_sync(
     async def submit_chunk_split(chunk_data: Tuple[bytes, Tuple[int, int]], port: int):
         chunk_bytes, original_pages = chunk_data
         result, error = await submit_chunk_with_page_split(
-            port, chunk_bytes, original_pages, filename, to_formats, image_export_mode, include_images
+            port, chunk_bytes, original_pages, filename, to_formats, image_export_mode, include_images,
+            do_ocr, force_ocr, ocr_engine, ocr_lang, do_table_structure, table_mode, pipeline
         )
         if error:
             logger.warning(f"[SYNC] Chunk {original_pages} failed: {error}")
@@ -1351,9 +1436,22 @@ async def convert_source_async(
     page_range = body.get("page_range")
     image_export_mode = body.get("image_export_mode", "embedded")
     include_images = body.get("include_images", True)
+    # OCR and table params
+    do_ocr = body.get("do_ocr", True)
+    force_ocr = body.get("force_ocr", False)
+    ocr_engine = body.get("ocr_engine", "easyocr")
+    ocr_lang = body.get("ocr_lang")
+    do_table_structure = body.get("do_table_structure", True)
+    table_mode = body.get("table_mode", "fast")
+    pipeline = body.get("pipeline", "standard")
 
     if not file_id and not sources:
         raise HTTPException(status_code=400, detail="Must provide either file_id or sources array")
+
+    # Validate OCR engine (ocrmac only works on macOS)
+    ocr_error = validate_ocr_engine(ocr_engine)
+    if ocr_error:
+        raise HTTPException(status_code=400, detail=ocr_error)
 
     if sources:
         # Proxy to worker - pass sources array directly (matches worker API)
@@ -1376,13 +1474,19 @@ async def convert_source_async(
         docling_body = {
             "sources": sources,
             "to_formats": body.get("to_formats", ["json"]),
+            "image_export_mode": image_export_mode,
+            "include_images": include_images,
+            "do_ocr": do_ocr,
+            "force_ocr": force_ocr,
+            "ocr_engine": ocr_engine,
+            "do_table_structure": do_table_structure,
+            "table_mode": table_mode,
+            "pipeline": pipeline,
         }
         if page_range:
             docling_body["page_range"] = page_range
-        if image_export_mode != "embedded":
-            docling_body["image_export_mode"] = image_export_mode
-        if not include_images:
-            docling_body["include_images"] = include_images
+        if ocr_lang:
+            docling_body["ocr_lang"] = ocr_lang
 
         async with httpx.AsyncClient(timeout=300.0) as client:
             resp = await client.post(
@@ -1424,6 +1528,11 @@ async def convert_source_async(
     limit_error = check_file_limits(file_bytes, api_key, filename=filename, is_pdf=is_pdf)
     if limit_error:
         raise HTTPException(status_code=413, detail=limit_error)
+
+    # Validate OCR engine (ocrmac only works on macOS)
+    ocr_error = validate_ocr_engine(ocr_engine)
+    if ocr_error:
+        raise HTTPException(status_code=400, detail=ocr_error)
 
     # Parse user page range if provided
     user_range = None
@@ -1472,6 +1581,13 @@ async def convert_source_async(
         total_pages=total_pages,
         image_export_mode=image_export_mode,
         include_images=include_images,
+        do_ocr=do_ocr,
+        force_ocr=force_ocr,
+        ocr_engine=ocr_engine,
+        ocr_lang=ocr_lang,
+        do_table_structure=do_table_structure,
+        table_mode=table_mode,
+        pipeline=pipeline,
     )
     await enqueue_job(job_request)
 
@@ -1505,9 +1621,22 @@ async def convert_source_sync(
     page_range = body.get("page_range")
     image_export_mode = body.get("image_export_mode", "embedded")
     include_images = body.get("include_images", True)
+    # OCR and table params
+    do_ocr = body.get("do_ocr", True)
+    force_ocr = body.get("force_ocr", False)
+    ocr_engine = body.get("ocr_engine", "easyocr")
+    ocr_lang = body.get("ocr_lang")
+    do_table_structure = body.get("do_table_structure", True)
+    table_mode = body.get("table_mode", "fast")
+    pipeline = body.get("pipeline", "standard")
 
     if not file_id and not sources:
         raise HTTPException(status_code=400, detail="Must provide either file_id or sources array")
+
+    # Validate OCR engine (ocrmac only works on macOS)
+    ocr_error = validate_ocr_engine(ocr_engine)
+    if ocr_error:
+        raise HTTPException(status_code=400, detail=ocr_error)
 
     if sources:
         # Proxy to worker - pass sources array directly (matches worker API)
@@ -1528,13 +1657,19 @@ async def convert_source_sync(
         docling_body = {
             "sources": sources,
             "to_formats": body.get("to_formats", ["json"]),
+            "image_export_mode": image_export_mode,
+            "include_images": include_images,
+            "do_ocr": do_ocr,
+            "force_ocr": force_ocr,
+            "ocr_engine": ocr_engine,
+            "do_table_structure": do_table_structure,
+            "table_mode": table_mode,
+            "pipeline": pipeline,
         }
         if page_range:
             docling_body["page_range"] = page_range
-        if image_export_mode != "embedded":
-            docling_body["image_export_mode"] = image_export_mode
-        if not include_images:
-            docling_body["include_images"] = include_images
+        if ocr_lang:
+            docling_body["ocr_lang"] = ocr_lang
 
         async with httpx.AsyncClient(timeout=600.0) as client:
             resp = await client.post(
@@ -1576,7 +1711,7 @@ async def convert_source_sync(
         if not coolest_port:
             coolest_port = available_workers[0]
 
-        task_id, error = await submit_to_worker(coolest_port, file_bytes, filename, to_formats, image_export_mode, include_images)
+        task_id, error = await submit_to_worker(coolest_port, file_bytes, filename, to_formats, image_export_mode, include_images, do_ocr, force_ocr, ocr_engine, ocr_lang, do_table_structure, table_mode, pipeline)
         if error:
             raise HTTPException(status_code=500, detail=f"Worker error: {error}")
 
@@ -1632,7 +1767,7 @@ async def convert_source_sync(
     # Submit all chunks
     async def submit_chunk(chunk_data, port):
         chunk_bytes, original_pages = chunk_data
-        task_id, error = await submit_to_worker(port, chunk_bytes, filename, to_formats, image_export_mode, include_images)
+        task_id, error = await submit_to_worker(port, chunk_bytes, filename, to_formats, image_export_mode, include_images, do_ocr, force_ocr, ocr_engine, ocr_lang, do_table_structure, table_mode, pipeline)
         if error:
             return None
         return (port, task_id, original_pages)

@@ -28,6 +28,14 @@ class JobRequest:
     total_pages: int = 0
     image_export_mode: str = "embedded"  # embedded, placeholder, referenced
     include_images: bool = True
+    # OCR and table params
+    do_ocr: bool = True
+    force_ocr: bool = False
+    ocr_engine: str = "easyocr"
+    ocr_lang: Optional[str] = None
+    do_table_structure: bool = True
+    table_mode: str = "fast"
+    pipeline: str = "standard"
     enqueued_at: float = field(default_factory=time.time)
 
 
@@ -184,7 +192,12 @@ async def _process_non_pdf(request: JobRequest, available_workers: List[int]):
     )
 
     # Submit to worker
-    task_id, error = await _submit_to_worker(coolest_port, request.file_bytes, request.filename, request.to_formats, request.image_export_mode, request.include_images)
+    task_id, error = await _submit_to_worker(
+        coolest_port, request.file_bytes, request.filename, request.to_formats,
+        request.image_export_mode, request.include_images,
+        request.do_ocr, request.force_ocr, request.ocr_engine, request.ocr_lang,
+        request.do_table_structure, request.table_mode, request.pipeline
+    )
 
     if error:
         logger.error(f"[QUEUE] Job {job_id}: worker submit error: {error}")
@@ -276,6 +289,13 @@ async def _process_pdf(request: JobRequest, available_workers: List[int]):
             workers_dict=_workers,
             image_export_mode=request.image_export_mode,
             include_images=request.include_images,
+            do_ocr=request.do_ocr,
+            force_ocr=request.force_ocr,
+            ocr_engine=request.ocr_engine,
+            ocr_lang=request.ocr_lang,
+            do_table_structure=request.do_table_structure,
+            table_mode=request.table_mode,
+            pipeline=request.pipeline,
         )
 
         if error:

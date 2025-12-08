@@ -30,6 +30,13 @@ async def submit_chunk_with_retry(
     workers_dict: Dict[str, dict],
     image_export_mode: str = "embedded",
     include_images: bool = True,
+    do_ocr: bool = True,
+    force_ocr: bool = False,
+    ocr_engine: str = "easyocr",
+    ocr_lang: Optional[str] = None,
+    do_table_structure: bool = True,
+    table_mode: str = "fast",
+    pipeline: str = "standard",
 ) -> Tuple[Optional[dict], Optional[str]]:
     """
     Submit chunk with automatic retry on failure.
@@ -55,7 +62,8 @@ async def submit_chunk_with_retry(
     """
     # Initial submission attempt
     result, error = await submit_func(
-        port, chunk_bytes, original_pages, filename, to_formats, image_export_mode, include_images
+        port, chunk_bytes, original_pages, filename, to_formats, image_export_mode, include_images,
+        do_ocr, force_ocr, ocr_engine, ocr_lang, do_table_structure, table_mode, pipeline
     )
 
     if error:
@@ -109,7 +117,8 @@ async def submit_chunk_with_retry(
         if retry_port:
             logger.info(f"[JOB {job_id}] RETRY: Submitting pages {original_pages[0]}-{original_pages[1]} to worker {retry_port}")
             result, error = await submit_func(
-                retry_port, chunk_bytes, original_pages, filename, to_formats, image_export_mode, include_images
+                retry_port, chunk_bytes, original_pages, filename, to_formats, image_export_mode, include_images,
+                do_ocr, force_ocr, ocr_engine, ocr_lang, do_table_structure, table_mode, pipeline
             )
             if error:
                 logger.error(f"[JOB {job_id}] RETRY: Worker {retry_port} also failed: {error}")

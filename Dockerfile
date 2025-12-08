@@ -6,7 +6,7 @@
 
 FROM python:3.13-slim
 
-# Install system dependencies + cloudflared for Cloudflare Tunnel
+# Install system dependencies + cloudflared for Cloudflare Tunnel + tesseract OCR
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
@@ -14,7 +14,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     libxrender1 \
     procps \
+    lsof \
     curl \
+    # Tesseract OCR with language packs (for tesseract/tesserocr engines)
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    tesseract-ocr-fra \
+    tesseract-ocr-deu \
+    tesseract-ocr-spa \
     && curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
        -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared \
     && rm -rf /var/lib/apt/lists/*
@@ -26,6 +33,7 @@ WORKDIR /app
 RUN pip install --no-cache-dir \
     docling-serve==1.9.0 \
     easyocr==1.7.2 \
+    rapidocr-onnxruntime \
     onnxruntime \
     httpx \
     psutil \
