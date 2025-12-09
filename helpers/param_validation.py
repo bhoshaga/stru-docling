@@ -1,0 +1,98 @@
+"""
+Parameter validation for API endpoints.
+
+Validates enum-like parameters upfront to return helpful 422 errors
+instead of accepting invalid values and failing later at worker level.
+"""
+import platform
+from typing import Optional
+
+IS_MACOS = platform.system() == "Darwin"
+
+# Valid values for enum-like parameters
+VALID_PIPELINES = ["legacy", "standard", "vlm", "asr"]
+VALID_IMAGE_EXPORT_MODES = ["embedded", "placeholder", "referenced"]
+VALID_TABLE_MODES = ["fast", "accurate"]
+VALID_OCR_ENGINES = ["auto", "easyocr", "rapidocr", "tesserocr", "tesseract"]
+if IS_MACOS:
+    VALID_OCR_ENGINES.append("ocrmac")
+
+
+def validate_conversion_params(
+    pipeline: str = "standard",
+    image_export_mode: str = "embedded",
+    table_mode: str = "fast",
+    ocr_engine: str = "easyocr",
+) -> Optional[str]:
+    """
+    Validate all conversion parameters at once.
+
+    Returns error message if any parameter is invalid, None if all OK.
+
+    Args:
+        pipeline: Processing pipeline (legacy, standard, vlm, asr)
+        image_export_mode: Image export mode (embedded, placeholder, referenced)
+        table_mode: Table structure mode (fast, accurate)
+        ocr_engine: OCR engine to use
+
+    Returns:
+        Error message string if validation fails, None if all parameters are valid.
+    """
+    # Validate pipeline
+    if pipeline not in VALID_PIPELINES:
+        return f"Invalid pipeline '{pipeline}'. Valid options: {', '.join(VALID_PIPELINES)}"
+
+    # Validate image_export_mode
+    if image_export_mode not in VALID_IMAGE_EXPORT_MODES:
+        return f"Invalid image_export_mode '{image_export_mode}'. Valid options: {', '.join(VALID_IMAGE_EXPORT_MODES)}"
+
+    # Validate table_mode
+    if table_mode not in VALID_TABLE_MODES:
+        return f"Invalid table_mode '{table_mode}'. Valid options: {', '.join(VALID_TABLE_MODES)}"
+
+    # Validate ocr_engine
+    if ocr_engine == "ocrmac" and not IS_MACOS:
+        return "ocrmac is only available on macOS. Valid options: " + ", ".join(VALID_OCR_ENGINES)
+    if ocr_engine not in VALID_OCR_ENGINES:
+        return f"Invalid ocr_engine '{ocr_engine}'. Valid options: {', '.join(VALID_OCR_ENGINES)}"
+
+    return None
+
+
+def validate_chunk_params(body: dict) -> Optional[str]:
+    """
+    Validate chunk endpoint parameters (convert_* prefixed).
+
+    Used by chunk endpoints which accept parameters with 'convert_' prefix.
+
+    Args:
+        body: JSON body dict from request
+
+    Returns:
+        Error message string if validation fails, None if all parameters are valid.
+    """
+    # Extract convert_* params with defaults
+    pipeline = body.get("convert_pipeline", "standard")
+    image_export_mode = body.get("convert_image_export_mode", "embedded")
+    table_mode = body.get("convert_table_mode", "fast")
+    ocr_engine = body.get("convert_ocr_engine", "easyocr")
+
+    # Validate pipeline
+    if pipeline not in VALID_PIPELINES:
+        return f"Invalid convert_pipeline '{pipeline}'. Valid options: {', '.join(VALID_PIPELINES)}"
+
+    # Validate image_export_mode
+    if image_export_mode not in VALID_IMAGE_EXPORT_MODES:
+        return f"Invalid convert_image_export_mode '{image_export_mode}'. Valid options: {', '.join(VALID_IMAGE_EXPORT_MODES)}"
+
+    # Validate table_mode
+    if table_mode not in VALID_TABLE_MODES:
+        return f"Invalid convert_table_mode '{table_mode}'. Valid options: {', '.join(VALID_TABLE_MODES)}"
+
+    # Validate ocr_engine
+    if ocr_engine == "ocrmac" and not IS_MACOS:
+        return "ocrmac is only available on macOS. Valid options: " + ", ".join(VALID_OCR_ENGINES)
+    if ocr_engine not in VALID_OCR_ENGINES:
+        return f"Invalid convert_ocr_engine '{ocr_engine}'. Valid options: {', '.join(VALID_OCR_ENGINES)}"
+
+    return None

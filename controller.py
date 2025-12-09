@@ -87,6 +87,7 @@ from helpers import (
     init_worker_router,
     submit_chunk_with_retry,
     validate_file_type,
+    validate_conversion_params,
 )
 
 # =============================================================================
@@ -98,19 +99,6 @@ import platform
 IS_MACOS = platform.system() == "Darwin"
 IS_LINUX = platform.system() == "Linux"
 
-# Valid OCR engines (ocrmac only works on macOS)
-VALID_OCR_ENGINES = ["auto", "easyocr", "rapidocr", "tesserocr", "tesseract"]
-if IS_MACOS:
-    VALID_OCR_ENGINES.append("ocrmac")
-
-
-def validate_ocr_engine(ocr_engine: str) -> str:
-    """Validate OCR engine, return error message if invalid, None if OK."""
-    if ocr_engine == "ocrmac" and not IS_MACOS:
-        return "ocrmac is only available on macOS. Use easyocr, tesseract, rapidocr, or auto instead."
-    if ocr_engine not in VALID_OCR_ENGINES and ocr_engine != "ocrmac":
-        return f"Invalid ocr_engine '{ocr_engine}'. Valid options: {', '.join(VALID_OCR_ENGINES)}"
-    return None
 
 
 # Watchdog settings
@@ -133,8 +121,10 @@ _default_max_unavailable = max(1, int(NUM_WORKERS * 0.3))
 MAX_UNAVAILABLE = int(os.environ.get("MAX_UNAVAILABLE", str(_default_max_unavailable)))
 
 # API authentication - Two tiers with limits (dynamic allocation)
-# 80% dedicated, 20% shared (minimum 1 shared)
-_num_shared = max(1, int(NUM_WORKERS * 0.2))
+# Default: 80% dedicated, 20% shared (minimum 1 shared)
+# Override with SHARED_WORKERS env var (set to 0 for all dedicated)
+_default_shared = max(1, int(NUM_WORKERS * 0.2))
+_num_shared = int(os.environ.get("SHARED_WORKERS", str(_default_shared)))
 _num_dedicated = NUM_WORKERS - _num_shared
 _dedicated_ports = list(range(MIN_PORT, MIN_PORT + _num_dedicated))
 _shared_ports = list(range(MIN_PORT + _num_dedicated, MAX_PORT + 1))
@@ -1180,10 +1170,10 @@ async def convert_file_async(
     if limit_error:
         raise HTTPException(status_code=413, detail=limit_error)
 
-    # Validate OCR engine (ocrmac only works on macOS)
-    ocr_error = validate_ocr_engine(ocr_engine)
-    if ocr_error:
-        raise HTTPException(status_code=400, detail=ocr_error)
+    # Validate conversion parameters
+    param_error = validate_conversion_params(pipeline, image_export_mode, table_mode, ocr_engine)
+    if param_error:
+        raise HTTPException(status_code=422, detail=param_error)
 
     # Parse user page range if provided
     user_range = None
@@ -1286,10 +1276,10 @@ async def convert_file_sync(
     if limit_error:
         raise HTTPException(status_code=413, detail=limit_error)
 
-    # Validate OCR engine (ocrmac only works on macOS)
-    ocr_error = validate_ocr_engine(ocr_engine)
-    if ocr_error:
-        raise HTTPException(status_code=400, detail=ocr_error)
+    # Validate conversion parameters
+    param_error = validate_conversion_params(pipeline, image_export_mode, table_mode, ocr_engine)
+    if param_error:
+        raise HTTPException(status_code=422, detail=param_error)
 
     # Get available workers (with detailed logging)
     available_workers = await get_available_workers(api_key, max_wait=60)
@@ -1448,10 +1438,10 @@ async def convert_source_async(
     if not file_id and not sources:
         raise HTTPException(status_code=400, detail="Must provide either file_id or sources array")
 
-    # Validate OCR engine (ocrmac only works on macOS)
-    ocr_error = validate_ocr_engine(ocr_engine)
-    if ocr_error:
-        raise HTTPException(status_code=400, detail=ocr_error)
+    # Validate conversion parameters
+    param_error = validate_conversion_params(pipeline, image_export_mode, table_mode, ocr_engine)
+    if param_error:
+        raise HTTPException(status_code=422, detail=param_error)
 
     if sources:
         # Proxy to worker - pass sources array directly (matches worker API)
@@ -1528,11 +1518,6 @@ async def convert_source_async(
     limit_error = check_file_limits(file_bytes, api_key, filename=filename, is_pdf=is_pdf)
     if limit_error:
         raise HTTPException(status_code=413, detail=limit_error)
-
-    # Validate OCR engine (ocrmac only works on macOS)
-    ocr_error = validate_ocr_engine(ocr_engine)
-    if ocr_error:
-        raise HTTPException(status_code=400, detail=ocr_error)
 
     # Parse user page range if provided
     user_range = None
@@ -1633,10 +1618,10 @@ async def convert_source_sync(
     if not file_id and not sources:
         raise HTTPException(status_code=400, detail="Must provide either file_id or sources array")
 
-    # Validate OCR engine (ocrmac only works on macOS)
-    ocr_error = validate_ocr_engine(ocr_engine)
-    if ocr_error:
-        raise HTTPException(status_code=400, detail=ocr_error)
+    # Validate conversion parameters
+    param_error = validate_conversion_params(pipeline, image_export_mode, table_mode, ocr_engine)
+    if param_error:
+        raise HTTPException(status_code=422, detail=param_error)
 
     if sources:
         # Proxy to worker - pass sources array directly (matches worker API)

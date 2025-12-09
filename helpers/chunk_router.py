@@ -5,11 +5,13 @@ These endpoints proxy chunk requests to workers.
 """
 import logging
 from io import BytesIO
-from typing import Dict
+from typing import Dict, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+from .param_validation import validate_chunk_params
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +66,10 @@ async def _proxy_chunk_request(
     endpoint_path: str,
     api_key: str,
     is_async: bool = False,
+    convert_pipeline: str = "standard",
+    convert_image_export_mode: str = "embedded",
+    convert_table_mode: str = "fast",
+    convert_ocr_engine: str = "easyocr",
 ) -> dict:
     """Proxy a chunk request to a single worker."""
     file_bytes = await files.read()
@@ -74,6 +80,16 @@ async def _proxy_chunk_request(
     limit_error = _check_file_limits(file_bytes, api_key, filename=filename, is_pdf=is_pdf)
     if limit_error:
         raise HTTPException(status_code=413, detail=limit_error)
+
+    # Validate conversion parameters
+    param_error = validate_chunk_params({
+        "convert_pipeline": convert_pipeline,
+        "convert_image_export_mode": convert_image_export_mode,
+        "convert_table_mode": convert_table_mode,
+        "convert_ocr_engine": convert_ocr_engine,
+    })
+    if param_error:
+        raise HTTPException(status_code=422, detail=param_error)
 
     # Get available workers (with detailed logging)
     available_workers = await _get_available_workers(api_key, max_wait=60)
@@ -90,9 +106,17 @@ async def _proxy_chunk_request(
     async with httpx.AsyncClient(timeout=300.0) as client:
         # Must wrap bytes in BytesIO for httpx async file uploads
         files_param = {"files": (filename, BytesIO(file_bytes), "application/octet-stream")}
+        # Build form data with conversion params
+        data = {
+            "convert_pipeline": convert_pipeline,
+            "convert_image_export_mode": convert_image_export_mode,
+            "convert_table_mode": convert_table_mode,
+            "convert_ocr_engine": convert_ocr_engine,
+        }
         resp = await client.post(
             f"http://127.0.0.1:{worker_port}{endpoint_path}",
             files=files_param,
+            data=data,
         )
 
         if resp.status_code != 200:
@@ -119,6 +143,14 @@ async def _proxy_chunk_source_request(
     is_async: bool = False,
 ) -> dict:
     """Proxy a chunk source (URL) request to a single worker."""
+    # Get JSON body first for validation
+    body = await request.json()
+
+    # Validate conversion parameters
+    param_error = validate_chunk_params(body)
+    if param_error:
+        raise HTTPException(status_code=422, detail=param_error)
+
     # Get available workers (with detailed logging)
     available_workers = await _get_available_workers(api_key, max_wait=60)
     if not available_workers:
@@ -130,9 +162,6 @@ async def _proxy_chunk_source_request(
         worker_port = available_workers[0]
 
     logger.info(f"[CHUNK] Proxying source {endpoint_path} to worker {worker_port}")
-
-    # Get JSON body
-    body = await request.json()
 
     async with httpx.AsyncClient(timeout=300.0) as client:
         resp = await client.post(
@@ -161,44 +190,84 @@ async def _proxy_chunk_source_request(
 @router.post("/v1/chunk/hierarchical/file")
 async def chunk_hierarchical_file(
     files: UploadFile = File(...),
+    convert_pipeline: str = Form("standard"),
+    convert_image_export_mode: str = Form("embedded"),
+    convert_table_mode: str = Form("fast"),
+    convert_ocr_engine: str = Form("easyocr"),
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
     """Hierarchical chunking of a document (sync)."""
     api_key = await _verify_api_key(credentials)
-    return await _proxy_chunk_request(files, "/v1/chunk/hierarchical/file", api_key)
+    return await _proxy_chunk_request(
+        files, "/v1/chunk/hierarchical/file", api_key,
+        convert_pipeline=convert_pipeline,
+        convert_image_export_mode=convert_image_export_mode,
+        convert_table_mode=convert_table_mode,
+        convert_ocr_engine=convert_ocr_engine,
+    )
 
 
 # Hierarchical chunking - async
 @router.post("/v1/chunk/hierarchical/file/async")
 async def chunk_hierarchical_file_async(
     files: UploadFile = File(...),
+    convert_pipeline: str = Form("standard"),
+    convert_image_export_mode: str = Form("embedded"),
+    convert_table_mode: str = Form("fast"),
+    convert_ocr_engine: str = Form("easyocr"),
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
     """Hierarchical chunking of a document (async)."""
     api_key = await _verify_api_key(credentials)
-    return await _proxy_chunk_request(files, "/v1/chunk/hierarchical/file/async", api_key, is_async=True)
+    return await _proxy_chunk_request(
+        files, "/v1/chunk/hierarchical/file/async", api_key, is_async=True,
+        convert_pipeline=convert_pipeline,
+        convert_image_export_mode=convert_image_export_mode,
+        convert_table_mode=convert_table_mode,
+        convert_ocr_engine=convert_ocr_engine,
+    )
 
 
 # Hybrid chunking - sync
 @router.post("/v1/chunk/hybrid/file")
 async def chunk_hybrid_file(
     files: UploadFile = File(...),
+    convert_pipeline: str = Form("standard"),
+    convert_image_export_mode: str = Form("embedded"),
+    convert_table_mode: str = Form("fast"),
+    convert_ocr_engine: str = Form("easyocr"),
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
     """Hybrid chunking of a document (sync)."""
     api_key = await _verify_api_key(credentials)
-    return await _proxy_chunk_request(files, "/v1/chunk/hybrid/file", api_key)
+    return await _proxy_chunk_request(
+        files, "/v1/chunk/hybrid/file", api_key,
+        convert_pipeline=convert_pipeline,
+        convert_image_export_mode=convert_image_export_mode,
+        convert_table_mode=convert_table_mode,
+        convert_ocr_engine=convert_ocr_engine,
+    )
 
 
 # Hybrid chunking - async
 @router.post("/v1/chunk/hybrid/file/async")
 async def chunk_hybrid_file_async(
     files: UploadFile = File(...),
+    convert_pipeline: str = Form("standard"),
+    convert_image_export_mode: str = Form("embedded"),
+    convert_table_mode: str = Form("fast"),
+    convert_ocr_engine: str = Form("easyocr"),
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
     """Hybrid chunking of a document (async)."""
     api_key = await _verify_api_key(credentials)
-    return await _proxy_chunk_request(files, "/v1/chunk/hybrid/file/async", api_key, is_async=True)
+    return await _proxy_chunk_request(
+        files, "/v1/chunk/hybrid/file/async", api_key, is_async=True,
+        convert_pipeline=convert_pipeline,
+        convert_image_export_mode=convert_image_export_mode,
+        convert_table_mode=convert_table_mode,
+        convert_ocr_engine=convert_ocr_engine,
+    )
 
 
 # =============================================================================

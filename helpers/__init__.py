@@ -52,6 +52,14 @@ from .file_validation import (
     is_supported_file,
     SUPPORTED_EXTENSIONS,
 )
+from .param_validation import (
+    validate_conversion_params,
+    validate_chunk_params,
+    VALID_PIPELINES,
+    VALID_IMAGE_EXPORT_MODES,
+    VALID_TABLE_MODES,
+    VALID_OCR_ENGINES,
+)
 from .job_queue import (
     JobRequest,
     init_queue as init_job_queue,
@@ -101,6 +109,13 @@ __all__ = [
     "validate_file_type",
     "is_supported_file",
     "SUPPORTED_EXTENSIONS",
+    # Param validation
+    "validate_conversion_params",
+    "validate_chunk_params",
+    "VALID_PIPELINES",
+    "VALID_IMAGE_EXPORT_MODES",
+    "VALID_TABLE_MODES",
+    "VALID_OCR_ENGINES",
     # Job queue
     "JobRequest",
     "init_job_queue",
