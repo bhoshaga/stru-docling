@@ -37,6 +37,7 @@ class JobRequest:
     table_mode: str = "fast"
     pipeline: str = "standard"
     vlm_pipeline_model: Optional[str] = None  # VLM model preset for vlm pipeline
+    asr_pipeline_model: Optional[str] = None  # ASR model preset for asr pipeline
     enqueued_at: float = field(default_factory=time.time)
 
 
@@ -198,7 +199,7 @@ async def _process_non_pdf(request: JobRequest, available_workers: List[int]):
         request.image_export_mode, request.include_images,
         request.do_ocr, request.force_ocr, request.ocr_engine, request.ocr_lang,
         request.do_table_structure, request.table_mode, request.pipeline,
-        request.vlm_pipeline_model
+        request.vlm_pipeline_model, request.asr_pipeline_model
     )
 
     if error:
@@ -299,6 +300,7 @@ async def _process_pdf(request: JobRequest, available_workers: List[int]):
             table_mode=request.table_mode,
             pipeline=request.pipeline,
             vlm_pipeline_model=request.vlm_pipeline_model,
+            asr_pipeline_model=request.asr_pipeline_model,
         )
 
         if error:

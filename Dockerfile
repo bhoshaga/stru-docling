@@ -6,7 +6,7 @@
 
 FROM python:3.13-slim
 
-# Install system dependencies + cloudflared for Cloudflare Tunnel + tesseract OCR
+# Install system dependencies + cloudflared for Cloudflare Tunnel + tesseract OCR + ffmpeg for ASR
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
@@ -16,6 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     lsof \
     curl \
+    # FFmpeg for audio processing (ASR pipeline)
+    ffmpeg \
     # Tesseract OCR with language packs (for tesseract/tesserocr engines)
     tesseract-ocr \
     tesseract-ocr-eng \
@@ -29,30 +31,43 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Set working directory
 WORKDIR /app
 
-# Install docling-serve and dependencies (includes stock docling-parse)
+# Install docling-serve and dependencies
+# IMPORTANT: docling-parse is pinned to match the prebuilt GIL-patched .so below
+# NOTE: vLLM is pulled in by docling-jobkit[vlm] on linux/amd64
 RUN pip install --no-cache-dir \
-    docling-serve==1.9.0 \
+    "docling-serve[ui]==1.9.0" \
+    docling-parse==4.7.2 \
     easyocr==1.7.2 \
     rapidocr-onnxruntime \
     onnxruntime \
     httpx \
     psutil \
     pypdf \
-    pymupdf
+    pymupdf \
+    openai-whisper
 
 # Copy prebuilt GIL-patched binary and overwrite stock version
+# BUILT FOR: docling-parse==4.7.2, CPython 3.13, linux/amd64, glibc (Debian)
+# If you change docling-parse version, you MUST rebuild the .so
 COPY prebuilt/linux_x86_64_cp313/pdf_parsers.cpython-313-x86_64-linux-gnu.so /tmp/
 RUN DOCLING_PARSE_PATH=$(python -c "import docling_parse; import os; print(os.path.dirname(docling_parse.__file__))") && \
     cp /tmp/pdf_parsers.cpython-313-x86_64-linux-gnu.so "$DOCLING_PARSE_PATH/" && \
-    rm /tmp/pdf_parsers.cpython-313-x86_64-linux-gnu.so
+    rm /tmp/pdf_parsers.cpython-313-x86_64-linux-gnu.so && \
+    pip show docling-parse | grep -q "Version: 4.7.2"
 
-# Pre-download HuggingFace models
-RUN python -c "from docling.datamodel.pipeline_options import PipelineOptions; \
-    from docling.document_converter import DocumentConverter; \
-    DocumentConverter()"
+# Copy patched docling_jobkit files for ASR support
+# These add the ASR pipeline handling that upstream docling-jobkit doesn't have yet
+COPY docling_jobkit_patched/convert.py /tmp/
+COPY docling_jobkit_patched/manager.py /tmp/
+RUN JOBKIT_PATH=$(python -c "import docling_jobkit; import os; print(os.path.dirname(docling_jobkit.__file__))") && \
+    cp /tmp/convert.py "$JOBKIT_PATH/datamodel/convert.py" && \
+    cp /tmp/manager.py "$JOBKIT_PATH/convert/manager.py" && \
+    rm /tmp/convert.py /tmp/manager.py
 
-# Pre-download EasyOCR models (detection + recognition for all default languages)
-RUN python -c "import easyocr; reader = easyocr.Reader(['fr', 'de', 'es', 'en'], gpu=False)"
+# NOTE: Models are NOT baked into image. Mount volume at /models
+# Run download_models.py on host before starting container:
+#   python3 download_models.py /path/to/models
+#   docker run -v /path/to/models:/models ...
 
 # Copy controller v2 with helpers
 COPY controller.py /app/
@@ -71,6 +86,12 @@ ENV DOCLING_SERVE_ENG_LOC_NUM_WORKERS=2
 ENV DOCLING_DEBUG_PROFILE_PIPELINE_TIMINGS=true
 ENV LOG_FILE=/app/server.log
 ENV RESULT_STORAGE_DIR=/data
+
+# Model cache directories (mount volume at /models)
+ENV HF_HOME=/models/huggingface
+ENV EASYOCR_MODULE_PATH=/models/easyocr
+ENV XDG_CACHE_HOME=/models
+ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
 
 # Expose controller port
 EXPOSE 8000

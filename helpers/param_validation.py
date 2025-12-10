@@ -27,6 +27,22 @@ VALID_VLM_MODELS = [
     # "got_ocr_2",
     # "granite_docling_vllm",
 ]
+VALID_ASR_MODELS = [
+    # Only whisper_turbo is supported in production (auto-detects MLX on Mac, native/CUDA on Linux)
+    "whisper_turbo",
+    # Other models are supported by docling but not pre-downloaded:
+    # "whisper_tiny",
+    # "whisper_small",
+    # "whisper_medium",
+    # "whisper_base",
+    # "whisper_large",
+    # Explicit MLX models (Apple Silicon only):
+    # "whisper_tiny_mlx", "whisper_small_mlx", "whisper_medium_mlx",
+    # "whisper_base_mlx", "whisper_large_mlx", "whisper_turbo_mlx",
+    # Explicit Native models (native/CUDA):
+    # "whisper_tiny_native", "whisper_small_native", "whisper_medium_native",
+    # "whisper_base_native", "whisper_large_native", "whisper_turbo_native",
+]
 
 
 def validate_conversion_params(
@@ -35,6 +51,7 @@ def validate_conversion_params(
     table_mode: str = "fast",
     ocr_engine: str = "easyocr",
     vlm_pipeline_model: Optional[str] = None,
+    asr_pipeline_model: Optional[str] = None,
 ) -> Optional[str]:
     """
     Validate all conversion parameters at once.
@@ -47,6 +64,7 @@ def validate_conversion_params(
         table_mode: Table structure mode (fast, accurate)
         ocr_engine: OCR engine to use
         vlm_pipeline_model: VLM model preset for vlm pipeline
+        asr_pipeline_model: ASR model preset for asr pipeline (whisper_turbo, etc.)
 
     Returns:
         Error message string if validation fails, None if all parameters are valid.
@@ -73,6 +91,10 @@ def validate_conversion_params(
     if vlm_pipeline_model is not None and vlm_pipeline_model not in VALID_VLM_MODELS:
         return f"Invalid vlm_pipeline_model '{vlm_pipeline_model}'. Valid options: {', '.join(VALID_VLM_MODELS)}"
 
+    # Validate asr_pipeline_model (only if provided)
+    if asr_pipeline_model is not None and asr_pipeline_model not in VALID_ASR_MODELS:
+        return f"Invalid asr_pipeline_model '{asr_pipeline_model}'. Valid options: {', '.join(VALID_ASR_MODELS)}"
+
     return None
 
 
@@ -94,6 +116,7 @@ def validate_chunk_params(body: dict) -> Optional[str]:
     table_mode = body.get("convert_table_mode", "fast")
     ocr_engine = body.get("convert_ocr_engine", "easyocr")
     vlm_pipeline_model = body.get("convert_vlm_pipeline_model")
+    asr_pipeline_model = body.get("convert_asr_pipeline_model")
 
     # Validate pipeline
     if pipeline not in VALID_PIPELINES:
@@ -116,5 +139,9 @@ def validate_chunk_params(body: dict) -> Optional[str]:
     # Validate vlm_pipeline_model (only if provided)
     if vlm_pipeline_model is not None and vlm_pipeline_model not in VALID_VLM_MODELS:
         return f"Invalid convert_vlm_pipeline_model '{vlm_pipeline_model}'. Valid options: {', '.join(VALID_VLM_MODELS)}"
+
+    # Validate asr_pipeline_model (only if provided)
+    if asr_pipeline_model is not None and asr_pipeline_model not in VALID_ASR_MODELS:
+        return f"Invalid convert_asr_pipeline_model '{asr_pipeline_model}'. Valid options: {', '.join(VALID_ASR_MODELS)}"
 
     return None

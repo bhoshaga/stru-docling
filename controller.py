@@ -815,6 +815,7 @@ async def submit_to_worker(
     table_mode: str = "fast",
     pipeline: str = "standard",
     vlm_pipeline_model: Optional[str] = None,
+    asr_pipeline_model: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """
     Submit a PDF chunk to a worker.
@@ -826,7 +827,7 @@ async def submit_to_worker(
     logger.info(f"Submitting to worker {port}: {len(pdf_bytes)} bytes, format={to_formats}, "
                 f"do_ocr={do_ocr}, force_ocr={force_ocr}, ocr_engine={ocr_engine}, ocr_lang={ocr_lang}, "
                 f"do_table_structure={do_table_structure}, table_mode={table_mode}, pipeline={pipeline}, "
-                f"vlm_pipeline_model={vlm_pipeline_model}, "
+                f"vlm_pipeline_model={vlm_pipeline_model}, asr_pipeline_model={asr_pipeline_model}, "
                 f"image_export_mode={image_export_mode}, include_images={include_images}")
 
     # Update worker state and activity when job is submitted
@@ -855,6 +856,8 @@ async def submit_to_worker(
                 data["ocr_lang"] = ocr_lang
             if vlm_pipeline_model:
                 data["vlm_pipeline_model"] = vlm_pipeline_model
+            if asr_pipeline_model:
+                data["asr_pipeline_model"] = asr_pipeline_model
 
             response = await client.post(url, files=files, data=data)
 
@@ -966,6 +969,7 @@ async def submit_chunk_with_page_split(
     table_mode: str = "fast",
     pipeline: str = "standard",
     vlm_pipeline_model: Optional[str] = None,
+    asr_pipeline_model: Optional[str] = None,
 ) -> Tuple[Optional[dict], Optional[str]]:
     """
     Submit a chunk by splitting into individual pages, running in parallel on the same worker,
@@ -986,7 +990,7 @@ async def submit_chunk_with_page_split(
 
     # If only 1 page, no split needed - direct submission + poll + get result
     if num_pages == 1:
-        task_id, error = await submit_to_worker(port, chunk_bytes, filename, to_formats, image_export_mode, include_images, do_ocr, force_ocr, ocr_engine, ocr_lang, do_table_structure, table_mode, pipeline, vlm_pipeline_model)
+        task_id, error = await submit_to_worker(port, chunk_bytes, filename, to_formats, image_export_mode, include_images, do_ocr, force_ocr, ocr_engine, ocr_lang, do_table_structure, table_mode, pipeline, vlm_pipeline_model, asr_pipeline_model)
         if error:
             return None, error
 
@@ -1038,7 +1042,7 @@ async def submit_chunk_with_page_split(
     # Submit all pages in parallel (I/O-bound)
     submit_start = time.time()
     async def submit_single_page(page_bytes: bytes, page_num: int):
-        task_id, error = await submit_to_worker(port, page_bytes, filename, to_formats, image_export_mode, include_images, do_ocr, force_ocr, ocr_engine, ocr_lang, do_table_structure, table_mode, pipeline, vlm_pipeline_model)
+        task_id, error = await submit_to_worker(port, page_bytes, filename, to_formats, image_export_mode, include_images, do_ocr, force_ocr, ocr_engine, ocr_lang, do_table_structure, table_mode, pipeline, vlm_pipeline_model, asr_pipeline_model)
         return (task_id, page_num, error)
 
     submit_tasks = [
@@ -1160,6 +1164,7 @@ async def convert_file_async(
     table_mode: str = Form("fast"),
     pipeline: str = Form("standard"),
     vlm_pipeline_model: Optional[str] = Form(None),
+    asr_pipeline_model: Optional[str] = Form(None),
     api_key: str = Depends(verify_api_key),
 ):
     """
@@ -1187,7 +1192,7 @@ async def convert_file_async(
         raise HTTPException(status_code=413, detail=limit_error)
 
     # Validate conversion parameters
-    param_error = validate_conversion_params(pipeline, image_export_mode, table_mode, ocr_engine, vlm_pipeline_model)
+    param_error = validate_conversion_params(pipeline, image_export_mode, table_mode, ocr_engine, vlm_pipeline_model, asr_pipeline_model)
     if param_error:
         raise HTTPException(status_code=422, detail=param_error)
 
@@ -1246,6 +1251,7 @@ async def convert_file_async(
         table_mode=table_mode,
         pipeline=pipeline,
         vlm_pipeline_model=vlm_pipeline_model,
+        asr_pipeline_model=asr_pipeline_model,
     )
     await enqueue_job(job_request)
 
@@ -1275,6 +1281,7 @@ async def convert_file_sync(
     table_mode: str = Form("fast"),
     pipeline: str = Form("standard"),
     vlm_pipeline_model: Optional[str] = Form(None),
+    asr_pipeline_model: Optional[str] = Form(None),
     api_key: str = Depends(verify_api_key),
 ):
     """
@@ -1295,7 +1302,7 @@ async def convert_file_sync(
         raise HTTPException(status_code=413, detail=limit_error)
 
     # Validate conversion parameters
-    param_error = validate_conversion_params(pipeline, image_export_mode, table_mode, ocr_engine, vlm_pipeline_model)
+    param_error = validate_conversion_params(pipeline, image_export_mode, table_mode, ocr_engine, vlm_pipeline_model, asr_pipeline_model)
     if param_error:
         raise HTTPException(status_code=422, detail=param_error)
 
@@ -1314,7 +1321,7 @@ async def convert_file_sync(
         logger.info(f"[SYNC] Non-PDF file, routing to single worker: {coolest_port}")
 
         # Submit to worker
-        task_id, error = await submit_to_worker(coolest_port, file_bytes, filename, to_formats, image_export_mode, include_images, do_ocr, force_ocr, ocr_engine, ocr_lang, do_table_structure, table_mode, pipeline, vlm_pipeline_model)
+        task_id, error = await submit_to_worker(coolest_port, file_bytes, filename, to_formats, image_export_mode, include_images, do_ocr, force_ocr, ocr_engine, ocr_lang, do_table_structure, table_mode, pipeline, vlm_pipeline_model, asr_pipeline_model)
         if error:
             raise HTTPException(status_code=500, detail=f"Worker error: {error}")
 
@@ -1392,7 +1399,7 @@ async def convert_file_sync(
         result, error = await submit_chunk_with_page_split(
             port, chunk_bytes, original_pages, filename, to_formats, image_export_mode, include_images,
             do_ocr, force_ocr, ocr_engine, ocr_lang, do_table_structure, table_mode, pipeline,
-            vlm_pipeline_model
+            vlm_pipeline_model, asr_pipeline_model
         )
         if error:
             logger.warning(f"[SYNC] Chunk {original_pages} failed: {error}")
@@ -1438,6 +1445,7 @@ async def convert_source_async(
     - to_formats: Output format (default: "json")
     - page_range: Optional [start, end] for PDF pages
     - vlm_pipeline_model: VLM model preset for vlm pipeline
+    - asr_pipeline_model: ASR model preset for asr pipeline
     """
     body = await request.json()
     file_id = body.get("file_id")
@@ -1455,12 +1463,13 @@ async def convert_source_async(
     table_mode = body.get("table_mode", "fast")
     pipeline = body.get("pipeline", "standard")
     vlm_pipeline_model = body.get("vlm_pipeline_model")
+    asr_pipeline_model = body.get("asr_pipeline_model")
 
     if not file_id and not sources:
         raise HTTPException(status_code=400, detail="Must provide either file_id or sources array")
 
     # Validate conversion parameters
-    param_error = validate_conversion_params(pipeline, image_export_mode, table_mode, ocr_engine, vlm_pipeline_model)
+    param_error = validate_conversion_params(pipeline, image_export_mode, table_mode, ocr_engine, vlm_pipeline_model, asr_pipeline_model)
     if param_error:
         raise HTTPException(status_code=422, detail=param_error)
 
@@ -1500,6 +1509,8 @@ async def convert_source_async(
             docling_body["ocr_lang"] = ocr_lang
         if vlm_pipeline_model:
             docling_body["vlm_pipeline_model"] = vlm_pipeline_model
+        if asr_pipeline_model:
+            docling_body["asr_pipeline_model"] = asr_pipeline_model
 
         async with httpx.AsyncClient(timeout=300.0) as client:
             resp = await client.post(
@@ -1597,6 +1608,7 @@ async def convert_source_async(
         table_mode=table_mode,
         pipeline=pipeline,
         vlm_pipeline_model=vlm_pipeline_model,
+        asr_pipeline_model=asr_pipeline_model,
     )
     await enqueue_job(job_request)
 
@@ -1639,12 +1651,13 @@ async def convert_source_sync(
     table_mode = body.get("table_mode", "fast")
     pipeline = body.get("pipeline", "standard")
     vlm_pipeline_model = body.get("vlm_pipeline_model")
+    asr_pipeline_model = body.get("asr_pipeline_model")
 
     if not file_id and not sources:
         raise HTTPException(status_code=400, detail="Must provide either file_id or sources array")
 
     # Validate conversion parameters
-    param_error = validate_conversion_params(pipeline, image_export_mode, table_mode, ocr_engine, vlm_pipeline_model)
+    param_error = validate_conversion_params(pipeline, image_export_mode, table_mode, ocr_engine, vlm_pipeline_model, asr_pipeline_model)
     if param_error:
         raise HTTPException(status_code=422, detail=param_error)
 
@@ -1682,6 +1695,8 @@ async def convert_source_sync(
             docling_body["ocr_lang"] = ocr_lang
         if vlm_pipeline_model:
             docling_body["vlm_pipeline_model"] = vlm_pipeline_model
+        if asr_pipeline_model:
+            docling_body["asr_pipeline_model"] = asr_pipeline_model
 
         async with httpx.AsyncClient(timeout=600.0) as client:
             resp = await client.post(

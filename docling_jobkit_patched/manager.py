@@ -1,0 +1,436 @@
+import enum
+import hashlib
+import json
+import logging
+import re
+import sys
+import threading
+from collections.abc import Iterable, Iterator
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Callable, Optional, Union
+
+from pydantic import BaseModel
+
+from docling.backend.docling_parse_backend import DoclingParseDocumentBackend
+from docling.backend.docling_parse_v2_backend import DoclingParseV2DocumentBackend
+from docling.backend.docling_parse_v4_backend import DoclingParseV4DocumentBackend
+from docling.backend.pdf_backend import PdfDocumentBackend
+from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
+from docling.datamodel import vlm_model_specs, asr_model_specs
+from docling.datamodel.base_models import DocumentStream, InputFormat
+from docling.datamodel.document import ConversionResult
+from docling.datamodel.pipeline_options import (
+    AsrPipelineOptions,
+    OcrOptions,
+    PdfBackend,
+    PdfPipelineOptions,
+    PictureDescriptionApiOptions,
+    PictureDescriptionVlmOptions,
+    ProcessingPipeline,
+    TableFormerMode,
+    VlmPipelineOptions,
+)
+from docling.datamodel.pipeline_options_vlm_model import ApiVlmOptions, InlineVlmOptions
+from docling.document_converter import AudioFormatOption, DocumentConverter, FormatOption, PdfFormatOption
+from docling.models.factories import get_ocr_factory
+from docling.pipeline.asr_pipeline import AsrPipeline
+from docling.pipeline.vlm_pipeline import VlmPipeline
+from docling_core.types.doc import ImageRefMode
+
+from docling_jobkit.datamodel.convert import ConvertDocumentsOptions
+
+_log = logging.getLogger(__name__)
+
+
+class DoclingConverterManagerConfig(BaseModel):
+    artifacts_path: Optional[Path] = None
+    options_cache_size: int = 2
+    enable_remote_services: bool = False
+    allow_external_plugins: bool = False
+
+    max_num_pages: int = sys.maxsize
+    max_file_size: int = sys.maxsize
+
+    # Threading pipeline
+    queue_max_size: Optional[int] = None
+    ocr_batch_size: Optional[int] = None
+    layout_batch_size: Optional[int] = None
+    table_batch_size: Optional[int] = None
+    batch_polling_interval_seconds: Optional[float] = None
+
+
+# Custom serializer for PdfFormatOption
+# (model_dump_json does not work with some classes)
+def _hash_pdf_format_option(pdf_format_option: PdfFormatOption) -> bytes:
+    data = pdf_format_option.model_dump(serialize_as_any=True)
+
+    # pipeline_options are not fully serialized by model_dump, dedicated pass
+    if pdf_format_option.pipeline_options:
+        data["pipeline_options"] = pdf_format_option.pipeline_options.model_dump(
+            serialize_as_any=True, mode="json"
+        )
+
+    # Replace `pipeline_cls` with a string representation
+    data["pipeline_cls"] = repr(data["pipeline_cls"])
+
+    # Replace `backend` with a string representation
+    data["backend"] = repr(data["backend"])
+
+    # Serialize the dictionary to JSON with sorted keys to have consistent hashes
+    serialized_data = json.dumps(data, sort_keys=True)
+    options_hash = hashlib.sha1(
+        serialized_data.encode(), usedforsecurity=False
+    ).digest()
+    return options_hash
+
+
+def _to_list_of_strings(input_value: Union[str, list[str]]) -> list[str]:
+    def split_and_strip(value: str) -> list[str]:
+        if re.search(r"[;,]", value):
+            return [item.strip() for item in re.split(r"[;,]", value)]
+        else:
+            return [value.strip()]
+
+    if isinstance(input_value, str):
+        return split_and_strip(input_value)
+    elif isinstance(input_value, list):
+        result = []
+        for item in input_value:
+            result.extend(split_and_strip(str(item)))
+        return result
+    else:
+        raise ValueError("Invalid input: must be a string or a list of strings.")
+
+
+class DoclingConverterManager:
+    def __init__(self, config: DoclingConverterManagerConfig):
+        self.config = config
+
+        self.ocr_factory = get_ocr_factory(
+            allow_external_plugins=self.config.allow_external_plugins
+        )
+        self._options_map: dict[bytes, PdfFormatOption] = {}
+        self._get_converter_from_hash = self._create_converter_cache_from_hash(
+            cache_size=self.config.options_cache_size
+        )
+
+        self._cache_lock = threading.Lock()
+
+    def _create_converter_cache_from_hash(
+        self, cache_size: int
+    ) -> Callable[[bytes], DocumentConverter]:
+        @lru_cache(maxsize=cache_size)
+        def _get_converter_from_hash(options_hash: bytes) -> DocumentConverter:
+            pdf_format_option = self._options_map[options_hash]
+            format_options: dict[InputFormat, FormatOption] = {
+                InputFormat.PDF: pdf_format_option,
+                InputFormat.IMAGE: pdf_format_option,
+            }
+
+            return DocumentConverter(format_options=format_options)
+
+        return _get_converter_from_hash
+
+    def clear_cache(self):
+        self._get_converter_from_hash.cache_clear()
+
+    def get_converter(self, pdf_format_option: PdfFormatOption) -> DocumentConverter:
+        with self._cache_lock:
+            options_hash = _hash_pdf_format_option(pdf_format_option)
+            self._options_map[options_hash] = pdf_format_option
+            converter = self._get_converter_from_hash(options_hash)
+        return converter
+
+    def _parse_standard_pdf_opts(
+        self, request: ConvertDocumentsOptions, artifacts_path: Optional[Path]
+    ) -> PdfPipelineOptions:
+        try:
+            kind = (
+                request.ocr_engine.value
+                if isinstance(request.ocr_engine, enum.Enum)
+                else str(request.ocr_engine)
+            )
+            ocr_options: OcrOptions = self.ocr_factory.create_options(  # type: ignore
+                kind=kind,
+                force_full_page_ocr=request.force_ocr,
+            )
+        except ImportError as err:
+            raise ImportError(
+                "The requested OCR engine"
+                f" (ocr_engine={request.ocr_engine})"
+                " is not available on this system. Please choose another OCR engine "
+                "or contact your system administrator.\n"
+                f"{err}"
+            )
+
+        if request.ocr_lang is not None:
+            ocr_options.lang = request.ocr_lang
+
+        pipeline_options = PdfPipelineOptions(
+            artifacts_path=artifacts_path,
+            allow_external_plugins=self.config.allow_external_plugins,
+            enable_remote_services=self.config.enable_remote_services,
+            document_timeout=request.document_timeout,
+            do_ocr=request.do_ocr,
+            ocr_options=ocr_options,
+            do_table_structure=request.do_table_structure,
+            do_code_enrichment=request.do_code_enrichment,
+            do_formula_enrichment=request.do_formula_enrichment,
+            do_picture_classification=request.do_picture_classification,
+            do_picture_description=request.do_picture_description,
+        )
+        pipeline_options.table_structure_options.mode = TableFormerMode(
+            request.table_mode
+        )
+        pipeline_options.table_structure_options.do_cell_matching = (
+            request.table_cell_matching
+        )
+
+        if request.image_export_mode != ImageRefMode.PLACEHOLDER:
+            pipeline_options.generate_page_images = True
+            if request.image_export_mode == ImageRefMode.REFERENCED:
+                pipeline_options.generate_picture_images = True
+            if request.images_scale:
+                pipeline_options.images_scale = request.images_scale
+
+        if request.picture_description_local is not None:
+            pipeline_options.picture_description_options = (
+                PictureDescriptionVlmOptions.model_validate(
+                    request.picture_description_local.model_dump()
+                )
+            )
+
+        if request.picture_description_api is not None:
+            pipeline_options.picture_description_options = (
+                PictureDescriptionApiOptions.model_validate(
+                    request.picture_description_api.model_dump()
+                )
+            )
+        pipeline_options.picture_description_options.picture_area_threshold = (
+            request.picture_description_area_threshold
+        )
+
+        # Forward the definition of the following attributes, if they are not none
+        for attr in (
+            "queue_max_size",
+            "ocr_batch_size",
+            "layout_batch_size",
+            "table_batch_size",
+            "batch_polling_interval_seconds",
+        ):
+            if value := getattr(self.config, attr):
+                setattr(pipeline_options, attr, value)
+
+        return pipeline_options
+
+    def _parse_backend(
+        self, request: ConvertDocumentsOptions
+    ) -> type[PdfDocumentBackend]:
+        if request.pdf_backend == PdfBackend.DLPARSE_V1:
+            backend: type[PdfDocumentBackend] = DoclingParseDocumentBackend
+        elif request.pdf_backend == PdfBackend.DLPARSE_V2:
+            backend = DoclingParseV2DocumentBackend
+        elif request.pdf_backend == PdfBackend.DLPARSE_V4:
+            backend = DoclingParseV4DocumentBackend
+        elif request.pdf_backend == PdfBackend.PYPDFIUM2:
+            backend = PyPdfiumDocumentBackend
+        else:
+            raise RuntimeError(f"Unexpected PDF backend type {request.pdf_backend}")
+
+        return backend
+
+    def _parse_vlm_pdf_opts(
+        self, request: ConvertDocumentsOptions, artifacts_path: Optional[Path]
+    ) -> VlmPipelineOptions:
+        pipeline_options = VlmPipelineOptions(
+            artifacts_path=artifacts_path,
+            document_timeout=request.document_timeout,
+            enable_remote_services=self.config.enable_remote_services,
+        )
+
+        if request.vlm_pipeline_model in (
+            None,
+            vlm_model_specs.VlmModelType.GRANITEDOCLING,
+        ):
+            pipeline_options.vlm_options = vlm_model_specs.GRANITEDOCLING_TRANSFORMERS
+            if sys.platform == "darwin":
+                try:
+                    import mlx_vlm  # noqa: F401
+
+                    pipeline_options.vlm_options = vlm_model_specs.GRANITEDOCLING_MLX
+                except ImportError:
+                    _log.warning(
+                        "To run GraniteDocling faster, please install mlx-vlm:\n"
+                        "pip install mlx-vlm"
+                    )
+
+        elif request.vlm_pipeline_model == vlm_model_specs.VlmModelType.GRANITE_VISION:
+            pipeline_options.vlm_options = vlm_model_specs.GRANITE_VISION_TRANSFORMERS
+
+        elif (
+            request.vlm_pipeline_model
+            == vlm_model_specs.VlmModelType.GRANITE_VISION_OLLAMA
+        ):
+            pipeline_options.vlm_options = vlm_model_specs.GRANITE_VISION_OLLAMA
+
+        if request.vlm_pipeline_model_local is not None:
+            pipeline_options.vlm_options = InlineVlmOptions.model_validate(
+                request.vlm_pipeline_model_local.model_dump()
+            )
+
+        if request.vlm_pipeline_model_api is not None:
+            pipeline_options.vlm_options = ApiVlmOptions.model_validate(
+                request.vlm_pipeline_model_api.model_dump()
+            )
+
+        return pipeline_options
+
+    def _parse_asr_opts(
+        self, request: ConvertDocumentsOptions, artifacts_path: Optional[Path]
+    ) -> AsrPipelineOptions:
+        """Parse ASR pipeline options from request."""
+        pipeline_options = AsrPipelineOptions(
+            artifacts_path=artifacts_path,
+        )
+
+        # Map AsrModelType enum to actual model specs
+        model_map = {
+            asr_model_specs.AsrModelType.WHISPER_TINY: asr_model_specs.WHISPER_TINY,
+            asr_model_specs.AsrModelType.WHISPER_SMALL: asr_model_specs.WHISPER_SMALL,
+            asr_model_specs.AsrModelType.WHISPER_MEDIUM: asr_model_specs.WHISPER_MEDIUM,
+            asr_model_specs.AsrModelType.WHISPER_BASE: asr_model_specs.WHISPER_BASE,
+            asr_model_specs.AsrModelType.WHISPER_LARGE: asr_model_specs.WHISPER_LARGE,
+            asr_model_specs.AsrModelType.WHISPER_TURBO: asr_model_specs.WHISPER_TURBO,
+            # Explicit MLX models
+            asr_model_specs.AsrModelType.WHISPER_TINY_MLX: asr_model_specs.WHISPER_TINY_MLX,
+            asr_model_specs.AsrModelType.WHISPER_SMALL_MLX: asr_model_specs.WHISPER_SMALL_MLX,
+            asr_model_specs.AsrModelType.WHISPER_MEDIUM_MLX: asr_model_specs.WHISPER_MEDIUM_MLX,
+            asr_model_specs.AsrModelType.WHISPER_BASE_MLX: asr_model_specs.WHISPER_BASE_MLX,
+            asr_model_specs.AsrModelType.WHISPER_LARGE_MLX: asr_model_specs.WHISPER_LARGE_MLX,
+            asr_model_specs.AsrModelType.WHISPER_TURBO_MLX: asr_model_specs.WHISPER_TURBO_MLX,
+            # Explicit Native models
+            asr_model_specs.AsrModelType.WHISPER_TINY_NATIVE: asr_model_specs.WHISPER_TINY_NATIVE,
+            asr_model_specs.AsrModelType.WHISPER_SMALL_NATIVE: asr_model_specs.WHISPER_SMALL_NATIVE,
+            asr_model_specs.AsrModelType.WHISPER_MEDIUM_NATIVE: asr_model_specs.WHISPER_MEDIUM_NATIVE,
+            asr_model_specs.AsrModelType.WHISPER_BASE_NATIVE: asr_model_specs.WHISPER_BASE_NATIVE,
+            asr_model_specs.AsrModelType.WHISPER_LARGE_NATIVE: asr_model_specs.WHISPER_LARGE_NATIVE,
+            asr_model_specs.AsrModelType.WHISPER_TURBO_NATIVE: asr_model_specs.WHISPER_TURBO_NATIVE,
+        }
+
+        if request.asr_pipeline_model is not None:
+            pipeline_options.asr_options = model_map.get(
+                request.asr_pipeline_model, asr_model_specs.WHISPER_TURBO
+            )
+        else:
+            # Default to WHISPER_TURBO (auto-selects best for hardware)
+            pipeline_options.asr_options = asr_model_specs.WHISPER_TURBO
+
+        return pipeline_options
+
+    def get_audio_pipeline_opts(
+        self,
+        request: ConvertDocumentsOptions,
+    ) -> AudioFormatOption:
+        """Get AudioFormatOption for ASR pipeline."""
+        artifacts_path: Optional[Path] = None
+        if self.config.artifacts_path is not None:
+            expanded_path = self.config.artifacts_path.expanduser()
+            if expanded_path.is_dir():
+                artifacts_path = expanded_path
+
+        asr_options = self._parse_asr_opts(request, artifacts_path)
+        return AudioFormatOption(
+            pipeline_cls=AsrPipeline,
+            pipeline_options=asr_options,
+        )
+
+    # Computes the PDF pipeline options and returns the PdfFormatOption and its hash
+    def get_pdf_pipeline_opts(
+        self,
+        request: ConvertDocumentsOptions,
+    ) -> PdfFormatOption:
+        artifacts_path: Optional[Path] = None
+        if self.config.artifacts_path is not None:
+            expanded_path = self.config.artifacts_path.expanduser()
+            if str(expanded_path.absolute()) == "":
+                _log.info(
+                    "artifacts_path is an empty path, model weights will be downloaded "
+                    "at runtime."
+                )
+                artifacts_path = None
+            elif expanded_path.is_dir():
+                _log.info(
+                    "artifacts_path is set to a valid directory. "
+                    "No model weights will be downloaded at runtime."
+                )
+                artifacts_path = expanded_path
+            else:
+                _log.warning(
+                    "artifacts_path is set to an invalid directory. "
+                    "The system will download the model weights at runtime."
+                )
+                artifacts_path = None
+        else:
+            _log.info(
+                "artifacts_path is unset. "
+                "The system will download the model weights at runtime."
+            )
+
+        pipeline_options: Union[PdfPipelineOptions, VlmPipelineOptions]
+        if request.pipeline == ProcessingPipeline.STANDARD:
+            pipeline_options = self._parse_standard_pdf_opts(request, artifacts_path)
+            backend = self._parse_backend(request)
+            pdf_format_option = PdfFormatOption(
+                pipeline_options=pipeline_options,
+                backend=backend,
+            )
+
+        elif request.pipeline == ProcessingPipeline.VLM:
+            pipeline_options = self._parse_vlm_pdf_opts(request, artifacts_path)
+            pdf_format_option = PdfFormatOption(
+                pipeline_cls=VlmPipeline, pipeline_options=pipeline_options
+            )
+        else:
+            raise NotImplementedError(
+                f"The pipeline {request.pipeline} is not implemented."
+            )
+
+        return pdf_format_option
+
+    def convert_documents(
+        self,
+        sources: Iterable[Union[Path, str, DocumentStream]],
+        options: ConvertDocumentsOptions,
+        headers: Optional[dict[str, Any]] = None,
+    ) -> Iterable[ConversionResult]:
+        # Handle ASR pipeline separately
+        if options.pipeline == ProcessingPipeline.ASR:
+            audio_format_option = self.get_audio_pipeline_opts(options)
+            format_options: dict[InputFormat, FormatOption] = {
+                InputFormat.AUDIO: audio_format_option,
+            }
+            converter = DocumentConverter(format_options=format_options)
+            with self._cache_lock:
+                converter.initialize_pipeline(format=InputFormat.AUDIO)
+            results: Iterator[ConversionResult] = converter.convert_all(
+                sources,
+                headers=headers,
+                max_file_size=self.config.max_file_size,
+            )
+            return results
+
+        # Standard PDF/VLM pipeline
+        pdf_format_option = self.get_pdf_pipeline_opts(options)
+        converter = self.get_converter(pdf_format_option)
+        with self._cache_lock:
+            converter.initialize_pipeline(format=InputFormat.PDF)
+        results = converter.convert_all(
+            sources,
+            headers=headers,
+            page_range=options.page_range,
+            max_file_size=self.config.max_file_size,
+            max_num_pages=self.config.max_num_pages,
+        )
+
+        return results
