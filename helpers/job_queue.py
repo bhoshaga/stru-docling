@@ -36,6 +36,7 @@ class JobRequest:
     do_table_structure: bool = True
     table_mode: str = "fast"
     pipeline: str = "standard"
+    vlm_pipeline_model: Optional[str] = None  # VLM model preset for vlm pipeline
     enqueued_at: float = field(default_factory=time.time)
 
 
@@ -128,7 +129,7 @@ async def job_queue_consumer():
                 # Mark job as failed
                 job = _job_manager.get_job(request.job_id)
                 if job:
-                    job.status = JobStatus.FAILED
+                    job.status = JobStatus.FAILURE
                     job.error = str(e)
                     job.completed_at = time.time()
             finally:
@@ -196,7 +197,8 @@ async def _process_non_pdf(request: JobRequest, available_workers: List[int]):
         coolest_port, request.file_bytes, request.filename, request.to_formats,
         request.image_export_mode, request.include_images,
         request.do_ocr, request.force_ocr, request.ocr_engine, request.ocr_lang,
-        request.do_table_structure, request.table_mode, request.pipeline
+        request.do_table_structure, request.table_mode, request.pipeline,
+        request.vlm_pipeline_model
     )
 
     if error:
@@ -296,6 +298,7 @@ async def _process_pdf(request: JobRequest, available_workers: List[int]):
             do_table_structure=request.do_table_structure,
             table_mode=request.table_mode,
             pipeline=request.pipeline,
+            vlm_pipeline_model=request.vlm_pipeline_model,
         )
 
         if error:

@@ -10,12 +10,23 @@ from typing import Optional
 IS_MACOS = platform.system() == "Darwin"
 
 # Valid values for enum-like parameters
-VALID_PIPELINES = ["legacy", "standard", "vlm", "asr"]
+VALID_PIPELINES = ["standard", "vlm", "asr"]  # "legacy" not supported by controller
 VALID_IMAGE_EXPORT_MODES = ["embedded", "placeholder", "referenced"]
 VALID_TABLE_MODES = ["fast", "accurate"]
 VALID_OCR_ENGINES = ["auto", "easyocr", "rapidocr", "tesserocr", "tesseract"]
 if IS_MACOS:
     VALID_OCR_ENGINES.append("ocrmac")
+VALID_VLM_MODELS = [
+    # Only granite_docling is currently supported (model downloaded in prepare.sh)
+    "granite_docling",
+    # "smoldocling",
+    # "smoldocling_vllm",
+    # "granite_vision",
+    # "granite_vision_vllm",
+    # "granite_vision_ollama",
+    # "got_ocr_2",
+    # "granite_docling_vllm",
+]
 
 
 def validate_conversion_params(
@@ -23,6 +34,7 @@ def validate_conversion_params(
     image_export_mode: str = "embedded",
     table_mode: str = "fast",
     ocr_engine: str = "easyocr",
+    vlm_pipeline_model: Optional[str] = None,
 ) -> Optional[str]:
     """
     Validate all conversion parameters at once.
@@ -34,6 +46,7 @@ def validate_conversion_params(
         image_export_mode: Image export mode (embedded, placeholder, referenced)
         table_mode: Table structure mode (fast, accurate)
         ocr_engine: OCR engine to use
+        vlm_pipeline_model: VLM model preset for vlm pipeline
 
     Returns:
         Error message string if validation fails, None if all parameters are valid.
@@ -56,6 +69,10 @@ def validate_conversion_params(
     if ocr_engine not in VALID_OCR_ENGINES:
         return f"Invalid ocr_engine '{ocr_engine}'. Valid options: {', '.join(VALID_OCR_ENGINES)}"
 
+    # Validate vlm_pipeline_model (only if provided)
+    if vlm_pipeline_model is not None and vlm_pipeline_model not in VALID_VLM_MODELS:
+        return f"Invalid vlm_pipeline_model '{vlm_pipeline_model}'. Valid options: {', '.join(VALID_VLM_MODELS)}"
+
     return None
 
 
@@ -76,6 +93,7 @@ def validate_chunk_params(body: dict) -> Optional[str]:
     image_export_mode = body.get("convert_image_export_mode", "embedded")
     table_mode = body.get("convert_table_mode", "fast")
     ocr_engine = body.get("convert_ocr_engine", "easyocr")
+    vlm_pipeline_model = body.get("convert_vlm_pipeline_model")
 
     # Validate pipeline
     if pipeline not in VALID_PIPELINES:
@@ -94,5 +112,9 @@ def validate_chunk_params(body: dict) -> Optional[str]:
         return "ocrmac is only available on macOS. Valid options: " + ", ".join(VALID_OCR_ENGINES)
     if ocr_engine not in VALID_OCR_ENGINES:
         return f"Invalid convert_ocr_engine '{ocr_engine}'. Valid options: {', '.join(VALID_OCR_ENGINES)}"
+
+    # Validate vlm_pipeline_model (only if provided)
+    if vlm_pipeline_model is not None and vlm_pipeline_model not in VALID_VLM_MODELS:
+        return f"Invalid convert_vlm_pipeline_model '{vlm_pipeline_model}'. Valid options: {', '.join(VALID_VLM_MODELS)}"
 
     return None
