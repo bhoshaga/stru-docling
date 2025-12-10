@@ -35,6 +35,7 @@ def epoch_to_utc(epoch: Optional[float]) -> Optional[str]:
 import httpx
 import psutil
 from fastapi import FastAPI, HTTPException, Request, Response, Depends, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
@@ -315,6 +316,15 @@ async def lifespan(app: FastAPI):
 # =============================================================================
 
 app = FastAPI(title="Docling Controller", version="2.0.0", lifespan=lifespan, openapi_url=None, docs_url=None, redoc_url=None)
+
+# CORS middleware - allow cross-origin requests from any origin
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods (GET, POST, OPTIONS, etc.)
+    allow_headers=["*"],  # Allow all headers (including Authorization)
+)
 
 # Include routers
 app.include_router(upload_router)
